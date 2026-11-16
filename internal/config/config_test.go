@@ -51,7 +51,7 @@ func TestLoadDefaults(t *testing.T) {
 	if imap.Host() != "imap.example.com" || imap.Username() != "private-user" || imap.Password() != "private-password" {
 		t.Fatal("connection credentials were not preserved")
 	}
-	if imap.TLS() != "tls" || imap.Port() != 993 || imap.CAFile() != "" {
+	if imap.TLS() != "auto" || imap.Port() != 993 || imap.CAFile() != "" {
 		t.Fatalf("unexpected connection defaults: tls=%q port=%d ca_file=%q", imap.TLS(), imap.Port(), imap.CAFile())
 	}
 	if imap.ConnectTimeout() != 10*time.Second || imap.OperationTimeout() != 60*time.Second {
@@ -148,13 +148,50 @@ operation_timeout_seconds = 120
 	}
 }
 
-func TestLoadSTARTTLSDefaultPort(t *testing.T) {
-	cfg, err := Load(writeConfig(t, credentials+`tls = "starttls"`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.IMAP().Port() != 143 || cfg.IMAP().TLSConfig().InsecureSkipVerify {
-		t.Fatal("STARTTLS must default to port 143 with certificate verification")
+func TestLoadTransportSettings(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		setting     string
+		mode        string
+		defaultPort int
+	}{
+		{"omitted", "", "auto", 993},
+		{"auto", "auto", "auto", 993},
+		{"tls", "tls", "tls", 993},
+		{"starttls", "starttls", "starttls", 143},
+		{"none", "none", "none", 143},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, port := range []int{0, 143, 993, 1143} {
+				name := strconv.Itoa(port)
+				if port == 0 {
+					name = "default"
+				}
+				t.Run(name, func(t *testing.T) {
+					content := credentials
+					if tt.setting != "" {
+						content += "tls = " + strconv.Quote(tt.setting) + "\n"
+					}
+					wantPort := tt.defaultPort
+					if port != 0 {
+						content += "port = " + strconv.Itoa(port) + "\n"
+						wantPort = port
+					}
+					cfg, err := Load(writeConfig(t, content))
+					if err != nil {
+						t.Fatal(err)
+					}
+					imap := cfg.IMAP()
+					if imap.TLS() != tt.mode || imap.Port() != wantPort {
+						t.Fatalf("transport = %q port = %d, want %q port = %d", imap.TLS(), imap.Port(), tt.mode, wantPort)
+					}
+					tlsConfig := imap.TLSConfig()
+					if tlsConfig.MinVersion != tls.VersionTLS12 || tlsConfig.ServerName != imap.Host() || tlsConfig.InsecureSkipVerify {
+						t.Fatal("TLS configuration must retain certificate and hostname verification in every transport mode")
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -192,7 +229,14 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"invalid port type", credentials + "port = \"private-password\"", "field type"},
 		{"fractional port", credentials + "port = 993.5", "field type"},
 		{"plaintext", credentials + "tls = \"plain\"", "imap.tls"},
+		{"unknown TLS", credentials + "tls = \"private-user-private-password\"", "imap.tls"},
 		{"empty TLS", credentials + "tls = \"\"", "imap.tls"},
+		{"uppercase auto", credentials + "tls = \"AUTO\"", "imap.tls"},
+		{"uppercase TLS", credentials + "tls = \"TLS\"", "imap.tls"},
+		{"uppercase STARTTLS", credentials + "tls = \"STARTTLS\"", "imap.tls"},
+		{"uppercase none", credentials + "tls = \"NONE\"", "imap.tls"},
+		{"leading TLS whitespace", credentials + "tls = \" auto\"", "imap.tls"},
+		{"trailing TLS whitespace", credentials + "tls = \"none \"", "imap.tls"},
 		{"invalid TLS type", credentials + "tls = false", "field type"},
 		{"zero connect timeout", credentials + "connect_timeout_seconds = 0", "imap.connect_timeout_seconds"},
 		{"negative connect timeout", credentials + "connect_timeout_seconds = -1", "imap.connect_timeout_seconds"},
@@ -205,6 +249,7 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		{"malformed TOML", credentials + "\"private-password private-user\" = [", "invalid TOML"},
 		{"secret unknown key", credentials + "\"private-password private-user\" = true", "unknown keys"},
 		{"missing CA file", credentials + "ca_file = \"private-password-private-user.pem\"", "imap.ca_file"},
+		{"missing CA file without TLS", credentials + "tls = \"none\"\nca_file = \"private-password-private-user.pem\"", "imap.ca_file"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -306,6 +351,27 @@ func TestLoadRelativeCAAndSnapshot(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "no valid certificates") {
 		t.Fatal("invalid CA contents must be rejected on the next load")
+	}
+}
+
+func TestLoadInvalidCAForAllModes(t *testing.T) {
+	for _, mode := range []string{"auto", "tls", "starttls", "none"} {
+		t.Run(mode, func(t *testing.T) {
+			path := writeConfig(t, credentials+"tls = "+strconv.Quote(mode)+"\nca_file = \"root.pem\"\n")
+			if err := os.WriteFile(filepath.Join(filepath.Dir(path), "root.pem"), []byte("private-user private-password"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err == nil || cfg != nil {
+				t.Fatal("invalid CA contents must be rejected in every transport mode")
+			}
+			if !strings.Contains(err.Error(), "no valid certificates") {
+				t.Fatalf("unexpected CA validation error: %v", err)
+			}
+			if strings.Contains(err.Error(), "private-user") || strings.Contains(err.Error(), "private-password") {
+				t.Fatal("CA validation error revealed credentials")
+			}
+		})
 	}
 }
 

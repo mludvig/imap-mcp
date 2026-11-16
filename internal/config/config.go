@@ -122,17 +122,18 @@ func Load(path string) (*Config, error) {
 		return nil, errors.New("imap.password is required")
 	}
 
-	imap.tlsMode = "tls"
+	// Automatic transport selection and port defaults are defined in docs/adr/0007-imap-transport-modes.md.
+	imap.tlsMode = "auto"
 	if input.IMAP.TLS != nil {
 		imap.tlsMode = *input.IMAP.TLS
 	}
 	switch imap.tlsMode {
-	case "tls":
+	case "auto", "tls":
 		imap.port = 993
-	case "starttls":
+	case "starttls", "none":
 		imap.port = 143
 	default:
-		return nil, errors.New("imap.tls must be tls or starttls")
+		return nil, errors.New("imap.tls must be auto, tls, starttls, or none")
 	}
 	if input.IMAP.Port != nil {
 		imap.port = *input.IMAP.Port

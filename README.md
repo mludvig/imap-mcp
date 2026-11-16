@@ -10,7 +10,7 @@ listener, SMTP sending, raw IMAP command tool, or permanent-delete tool.
 Install Go **1.25 or newer**, then run from this checkout:
 
 ```sh
-make build
+make
 imap_mcp_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/imap-mcp"
 install -d -m 700 "$imap_mcp_config_dir"
 install -m 600 config.example.toml "$imap_mcp_config_dir/config.toml"
@@ -30,7 +30,7 @@ host = "imap.example.com"
 port = 993
 username = "user@example.com"
 password = "your-password"
-tls = "tls"
+tls = "auto"
 connect_timeout_seconds = 10
 operation_timeout_seconds = 60
 # ca_file = "private-ca.pem"
@@ -39,13 +39,26 @@ operation_timeout_seconds = 60
 path = "headers.sqlite3"
 ```
 
-`tls = "tls"` uses implicit TLS, default port 993. `tls = "starttls"` requires
-STARTTLS, default port 143. Verify which mode the server offers on the chosen
-port before changing either setting; an explicit `port` overrides the mode's
-default.
-Both modes verify the certificate and hostname; a failed STARTTLS or verification
-fails the connection. There is no automatic fallback or insecure mode.
-`ca_file` adds a private CA to the system trust roots.
+`imap.tls` accepts these exact values; an explicit `port` overrides the default:
+
+| Mode | Default port | Connection behavior |
+| --- | --- | --- |
+| `auto` (also when omitted) | 993 | Verified implicit TLS on port 993; on every other port, read the plaintext greeting/capabilities and upgrade if STARTTLS is advertised, otherwise remain plaintext |
+| `tls` | 993 | Require verified implicit TLS on the chosen port |
+| `starttls` | 143 | Require a verified STARTTLS upgrade before client authentication |
+| `none` | 143 | Use plaintext, even when STARTTLS is advertised |
+
+`auto` depends on the server's plaintext STARTTLS advertisement on non-993
+ports; plaintext without that advertisement is normal successful behavior.
+Use explicit `tls` for implicit TLS on a custom port, or `starttls` to require
+an upgrade. Auto detection uses one connection and upgrades the same IMAP client;
+a failed advertised STARTTLS or certificate check fails the connection without
+plaintext fallback or retry. Every TLS connection verifies the certificate and
+hostname; `ca_file` adds a private CA to the system trust roots.
+
+A plaintext PREAUTH greeting is accepted by `none` and by `auto` without a
+STARTTLS advertisement; the session is already authenticated. Required STARTTLS,
+or `auto` with advertised STARTTLS, rejects plaintext PREAUTH.
 
 Relative `cache.path` and `imap.ca_file` paths resolve beside the TOML file.
 An empty cache path uses the OS user cache directory at
@@ -73,7 +86,7 @@ full usage and options without loading configuration or connecting.
 
 | Verbosity | Diagnostics on stderr |
 | --- | --- |
-| Default | Resolved config/cache paths, readonly mode, connection-check progress, readiness |
+| Default | Resolved config/cache paths, readonly mode, actual IMAP transport, connection-check progress, readiness |
 | `--quiet` | Errors only |
 | `--verbose` | Default output plus lifecycle detail |
 | `--debug` | Verbose output plus fixed startup stages and timings |
@@ -82,10 +95,11 @@ The enabled `--quiet`, `--verbose`, and `--debug` modes are pairwise mutually
 exclusive. Debug output includes no raw IMAP traffic, credentials, or message
 contents.
 
-Startup loads the configuration, opens the cache, and checks a verified TLS IMAP
-session through authentication before serving MCP. The check uses
-`connect_timeout_seconds` and `operation_timeout_seconds`, closes its session,
-and only then reports readiness; later tool calls open their own sessions.
+Startup loads the configuration, opens the cache, and establishes the configured
+IMAP transport. Diagnostics report actual implicit TLS, STARTTLS, or plaintext
+transport before client authentication. The check validates an authenticated
+session within `connect_timeout_seconds` and `operation_timeout_seconds`, closes
+it, and only then reports MCP readiness; later tool calls open their own sessions.
 A failed check exits with status 1 instead of advertising offline readiness.
 
 | Exit status | Meaning |
@@ -300,8 +314,10 @@ does not expose every related command.
 | UIDPLUS, MOVE | Authoritative destination mappings and guarded native moves |
 
 The pinned IMAP client includes local corrections for VANISHED responses during
-native IMAP4rev2 MOVE and mode-aware mailbox names; see [ADR 0004](docs/adr/0004-backport-imap4rev2-vanished.md)
-and [ADR 0005](docs/adr/0005-mode-aware-mailbox-names.md). Mailbox inputs and
+native IMAP4rev2 MOVE, mode-aware mailbox names, and a public STARTTLS upgrade on
+the same client; see [ADR 0004](docs/adr/0004-backport-imap4rev2-vanished.md),
+[ADR 0005](docs/adr/0005-mode-aware-mailbox-names.md), and
+[ADR 0007](docs/adr/0007-imap-transport-modes.md). Mailbox inputs and
 returned names preserve Unicode and literal ampersands: the wire codec uses
 raw UTF-8 in modern mode and modified UTF-7 in legacy IMAP4rev1.
 This preserves mailbox identity without adding full Net-Unicode normalization
@@ -335,14 +351,17 @@ large valid IDs. HTML, headers, filenames, and mail contents are untrusted data.
 ## Development and integration
 
 ```sh
-make build
+make
 make test
 make integration
 ```
 
 The Makefile prefers `.tools/go/bin/go` when installed, otherwise `go`, and
-keeps its Go caches and temporary files inside `.tools/`. To run race and vet
-checks with the same environment:
+keeps its Go caches and temporary files inside `.tools/`. Plain `make` builds
+`bin/imap-mcp`; `make build` remains available. `make clean` removes `bin/`,
+the repo-local Go build cache (`.tools/cache/build/`), and build/test scratch
+(`.tools/tmp/`), retaining the installed toolchain, downloaded dependencies, and
+mail cache. To run race and vet checks with the same environment:
 
 ```sh
 export GOTOOLCHAIN=local
@@ -398,8 +417,14 @@ integration suite on 2026-11-17 with Go 1.25.14. Regressions cover configuration
 discovery, verbosity, startup authentication/TLS failures, connection release,
 timeouts, cancellation, and stdout JSON-RPC purity.
 
+The transport-mode changes passed root and local-module unit, race, and vet
+checks, plus the complete Dovecot integration suite, on 2026-11-17. An actual
+`make clean` followed by plain `make` removed and rebuilt the compilation
+artifacts while preserving source, the toolchain, and dependency downloads.
+
 The [architecture decisions](docs/adr/0001-go-stdio-startup-policy.md),
 [Linux CLI startup decision](docs/adr/0006-linux-cli-startup-validation.md),
+[IMAP transport modes](docs/adr/0007-imap-transport-modes.md),
 [cache coherence](docs/concepts/cache-coherence.md),
 [message identity](docs/concepts/message-identity.md),
 [IMAP safety](docs/concepts/imap-safety.md), and

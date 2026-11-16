@@ -68,7 +68,7 @@ func TestConfigurationErrorsDoNotExposeCredentials(t *testing.T) {
 		for _, mode := range []string{"--quiet", "--verbose", "--debug"} {
 			var stderr bytes.Buffer
 			code := runWithHooks(context.Background(), []string{"--config", path, mode}, &stderr,
-				func(context.Context, *config.Config) error {
+				func(context.Context, *config.Config, func(string)) error {
 					t.Fatal("invalid configuration/cache reached probe")
 					return nil
 				}, noServe)
@@ -100,7 +100,10 @@ func writeCLIConfig(t *testing.T, path, policy, cachePath string) {
 	}
 }
 
-func noProbe(context.Context, *config.Config) error   { return nil }
+func noProbe(_ context.Context, _ *config.Config, reportTransport func(string)) error {
+	reportTransport("tls")
+	return nil
+}
 func noServe(context.Context, *service.Service) error { return nil }
 
 func assertCacheReleased(t *testing.T, path string) {
@@ -135,11 +138,12 @@ func TestConfigDiscovery(t *testing.T) {
 			probed := false
 			var stderr bytes.Buffer
 			code := runWithHooks(context.Background(), nil, &stderr,
-				func(_ context.Context, cfg *config.Config) error {
+				func(_ context.Context, cfg *config.Config, reportTransport func(string)) error {
 					probed = true
 					if cfg.CachePath() != wantCache || cfg.IMAP().Password() != "super-secret" {
 						t.Fatalf("unexpected discovered configuration: cache=%q", cfg.CachePath())
 					}
+					reportTransport("tls")
 					return nil
 				}, noServe)
 			if code != 0 || !probed || !strings.Contains(stderr.String(), fmt.Sprintf("%q", path)) || !strings.Contains(stderr.String(), fmt.Sprintf("%q", wantCache)) {
@@ -161,10 +165,11 @@ func TestExplicitConfigOverridesDiscoveryAndUsesWorkingDirectory(t *testing.T) {
 	var stderr bytes.Buffer
 	served := false
 	code := runWithHooks(context.Background(), []string{"--config", "relative/config.toml"}, &stderr,
-		func(_ context.Context, cfg *config.Config) error {
+		func(_ context.Context, cfg *config.Config, reportTransport func(string)) error {
 			if cfg.CachePath() != wantCache || cfg.Readonly() {
 				t.Fatalf("explicit configuration not loaded: cache=%q readonly=%v", cfg.CachePath(), cfg.Readonly())
 			}
+			reportTransport("tls")
 			return nil
 		},
 		func(_ context.Context, svc *service.Service) error {
@@ -216,7 +221,7 @@ func TestStartupVerbosityAndStageOrdering(t *testing.T) {
 			var stderr bytes.Buffer
 			probed, served := false, false
 			code := runWithHooks(context.Background(), args, &stderr,
-				func(ctx context.Context, cfg *config.Config) error {
+				func(ctx context.Context, cfg *config.Config, reportTransport func(string)) error {
 					probed = true
 					deadline, ok := ctx.Deadline()
 					if !ok || time.Until(deadline) > cfg.IMAP().OperationTimeout() {
@@ -229,6 +234,7 @@ func TestStartupVerbosityAndStageOrdering(t *testing.T) {
 						store.Close()
 						t.Fatal("cache lock must be held during probe")
 					}
+					reportTransport("tls")
 					return nil
 				},
 				func(_ context.Context, _ *service.Service) error {
@@ -251,7 +257,7 @@ func TestStartupVerbosityAndStageOrdering(t *testing.T) {
 				}
 			} else {
 				previous := -1
-				for _, stage := range []string{"loading configuration", "opening header cache", "configuration:", "header cache:", "mode: readonly", "checking IMAP connection", "connection closed", "ready:"} {
+				for _, stage := range []string{"loading configuration", "opening header cache", "configuration:", "header cache:", "mode: readonly", "checking IMAP connection", "transport: implicit TLS (verified)", "connection closed", "ready:"} {
 					index := strings.Index(output, stage)
 					if index <= previous {
 						t.Fatalf("wrong order for %q: %s", stage, output)
@@ -293,6 +299,148 @@ func TestDisabledVerbosityFlagsDoNotConflict(t *testing.T) {
 	}
 }
 
+func TestTransportDiagnosticIsReportedDuringProbe(t *testing.T) {
+	for _, transport := range []struct {
+		name  string
+		mode  string
+		label string
+	}{
+		{"tls", "tls", "transport: implicit TLS (verified)"},
+		{"starttls", "starttls", "transport: STARTTLS (verified)"},
+		{"none", "none", "transport: plaintext"},
+		{"unknown", "super-secret private-user AUTH LOGIN (verified)", ""},
+	} {
+		for _, quiet := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/quiet=%v", transport.name, quiet), func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "config.toml")
+				cachePath := filepath.Join(dir, "headers.sqlite3")
+				writeCLIConfig(t, path, "", cachePath)
+				args := []string{"--config", path}
+				if quiet {
+					args = append(args, "--quiet")
+				}
+				var stderr bytes.Buffer
+				served := false
+				code := runWithHooks(context.Background(), args, &stderr,
+					func(_ context.Context, _ *config.Config, reportTransport func(string)) error {
+						reportTransport(transport.mode)
+						output := stderr.String()
+						if !quiet && transport.label != "" && !strings.Contains(output, "imap-mcp: "+transport.label+"\n") {
+							t.Fatalf("transport must be reported before probe returns: %q", output)
+						}
+						for _, forbidden := range []string{"connection check succeeded", "ready:"} {
+							if strings.Contains(output, forbidden) {
+								t.Fatalf("probe reported %q before authentication completed: %q", forbidden, output)
+							}
+						}
+						return nil
+					},
+					func(context.Context, *service.Service) error {
+						served = true
+						if !quiet && transport.label != "" {
+							output := stderr.String()
+							labelIndex := strings.Index(output, transport.label)
+							successIndex := strings.Index(output, "connection check succeeded")
+							readyIndex := strings.Index(output, "ready:")
+							if labelIndex < 0 || successIndex <= labelIndex || readyIndex <= successIndex {
+								t.Fatalf("transport, success and readiness must precede serving in order: %q", output)
+							}
+						}
+						return nil
+					})
+				output := stderr.String()
+				if code != 0 || !served {
+					t.Fatalf("code=%d served=%v stderr=%q", code, served, output)
+				}
+				if quiet && output != "" {
+					t.Fatalf("quiet output: %q", output)
+				}
+				wantCount := 0
+				if !quiet && transport.label != "" {
+					wantCount = 1
+				}
+				if strings.Count(output, "transport:") != wantCount {
+					t.Fatalf("unexpected transport diagnostics: %q", output)
+				}
+				if transport.mode != "tls" && transport.mode != "starttls" && strings.Contains(output, "(verified)") {
+					t.Fatalf("plaintext or unknown transport claimed TLS verification: %q", output)
+				}
+				for _, forbidden := range []string{"secret-host", "private-user", "super-secret", "AUTH", "LOGIN"} {
+					if strings.Contains(output, forbidden) {
+						t.Fatalf("transport diagnostic disclosed %q: %q", forbidden, output)
+					}
+				}
+				assertCacheReleased(t, cachePath)
+			})
+		}
+	}
+}
+
+func TestFailedProbeReportsOnlyEstablishedTransport(t *testing.T) {
+	for _, failure := range []struct {
+		name      string
+		transport string
+		label     string
+		err       error
+	}{
+		{"connection", "", "", errors.New("secret-host private-user super-secret server error")},
+		{"TLS handshake", "", "", mail.NewError("tls_failed", "IMAP TLS negotiation failed")},
+		{"TLS authentication", "tls", "transport: implicit TLS (verified)", mail.NewError("authentication_failed", "IMAP authentication failed")},
+		{"STARTTLS authentication", "starttls", "transport: STARTTLS (verified)", mail.NewError("authentication_failed", "IMAP authentication failed")},
+		{"plaintext authentication", "none", "transport: plaintext", mail.NewError("authentication_failed", "IMAP authentication failed")},
+	} {
+		for _, quiet := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/quiet=%v", failure.name, quiet), func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "config.toml")
+				cachePath := filepath.Join(dir, "headers.sqlite3")
+				writeCLIConfig(t, path, "", cachePath)
+				args := []string{"--config", path}
+				if quiet {
+					args = append(args, "--quiet")
+				}
+				var stderr bytes.Buffer
+				code := runWithHooks(context.Background(), args, &stderr,
+					func(_ context.Context, _ *config.Config, reportTransport func(string)) error {
+						if failure.transport != "" {
+							reportTransport(failure.transport)
+						}
+						return fmt.Errorf("private-user super-secret wrapper: %w", failure.err)
+					},
+					func(context.Context, *service.Service) error {
+						t.Fatal("failed authentication started MCP")
+						return nil
+					})
+				output := stderr.String()
+				if code != 1 || !strings.Contains(output, "IMAP connection check failed") {
+					t.Fatalf("code=%d stderr=%q", code, output)
+				}
+				if quiet && strings.Count(output, "\n") != 1 {
+					t.Fatalf("quiet must retain only the error: %q", output)
+				}
+				if wantLabel := !quiet && failure.label != ""; strings.Contains(output, "transport:") != wantLabel {
+					t.Fatalf("unexpected transport label: %q", output)
+				}
+				if !quiet && failure.label != "" {
+					if labelIndex := strings.Index(output, failure.label); labelIndex < 0 || labelIndex > strings.Index(output, "IMAP connection check failed") {
+						t.Fatalf("established transport must precede failure: %q", output)
+					}
+				}
+				if failure.transport != "tls" && failure.transport != "starttls" && strings.Contains(output, "(verified)") {
+					t.Fatalf("failed handshake or plaintext claimed TLS verification: %q", output)
+				}
+				for _, forbidden := range []string{"ready:", "connection check succeeded", "secret-host", "private-user", "super-secret"} {
+					if strings.Contains(output, forbidden) {
+						t.Fatalf("failed startup disclosed %q: %q", forbidden, output)
+					}
+				}
+				assertCacheReleased(t, cachePath)
+			})
+		}
+	}
+}
+
 func TestProbeFailureStopsStartupAndReleasesCache(t *testing.T) {
 	for _, verbosity := range []string{"--quiet", "--debug"} {
 		for _, failure := range []error{
@@ -306,7 +454,9 @@ func TestProbeFailureStopsStartupAndReleasesCache(t *testing.T) {
 				writeCLIConfig(t, path, "", cachePath)
 				var stderr bytes.Buffer
 				code := runWithHooks(context.Background(), []string{"--config", path, verbosity}, &stderr,
-					func(context.Context, *config.Config) error { return fmt.Errorf("private-user wrapper: %w", failure) },
+					func(context.Context, *config.Config, func(string)) error {
+						return fmt.Errorf("private-user wrapper: %w", failure)
+					},
 					func(context.Context, *service.Service) error {
 						t.Fatal("failed probe started MCP")
 						return nil
@@ -343,12 +493,13 @@ func TestCancellationDuringProbeAndServing(t *testing.T) {
 			defer cancel()
 			var stderr bytes.Buffer
 			code := runWithHooks(ctx, []string{"--config", path}, &stderr,
-				func(probeCtx context.Context, _ *config.Config) error {
+				func(probeCtx context.Context, _ *config.Config, reportTransport func(string)) error {
 					if stage == "probe" {
 						cancel()
 						<-probeCtx.Done()
 						return probeCtx.Err()
 					}
+					reportTransport("tls")
 					return nil
 				},
 				func(serverCtx context.Context, _ *service.Service) error {

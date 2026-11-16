@@ -54,8 +54,11 @@ func TestCLIStartupDovecot(t *testing.T) {
 		{name: "home-default", mode: "tls", readonly: true, home: true},
 		{name: "explicit-relative-override", mode: "tls", readonly: true, relative: true},
 		{name: "verbose-starttls-read-write", mode: "starttls", flag: "--verbose"},
+		{name: "auto-custom-starttls-port", mode: "auto", readonly: true},
+		{name: "omitted-tls-custom-starttls-port", readonly: true},
 		{name: "debug", mode: "tls", readonly: true, flag: "--debug"},
 		{name: "quiet", mode: "tls", readonly: true, flag: "--quiet"},
+		{name: "quiet-auto", mode: "auto", readonly: true, flag: "--quiet"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -73,7 +76,7 @@ func TestCLIStartupDovecot(t *testing.T) {
 			if test.flag != "" {
 				args = append(args, test.flag)
 			}
-			source, cachePath := mcpFixtureConfig(t, f, test.mode, test.readonly, "Trash")
+			source, cachePath := startupTransportConfig(t, f, test.mode, test.readonly)
 			body, err := os.ReadFile(source)
 			if err != nil {
 				t.Fatal(err)
@@ -95,6 +98,10 @@ func TestCLIStartupDovecot(t *testing.T) {
 			}
 			// No tool above touches IMAP. The startup probe must already be gone.
 			assertStartupConnectionReleased(t, f)
+			if test.mode == "auto" || test.mode == "" {
+				assertStartupMailboxStatus(t, p, f)
+				assertStartupConnectionReleased(t, f)
+			}
 			p.close(t)
 			assertStartupProtocolStdout(t, p.stdout.String())
 			assertCacheReleased(t, cachePath)
@@ -121,6 +128,11 @@ func TestCLIStartupDovecot(t *testing.T) {
 				t.Errorf("startup stderr missing %s mode: %s", mode, diagnostics)
 			}
 			lower := strings.ToLower(diagnostics)
+			wantTransport := "transport: implicit TLS (verified)"
+			if test.mode != "tls" {
+				wantTransport = "transport: STARTTLS (verified)"
+			}
+			assertStartupTransport(t, diagnostics, wantTransport)
 			if !strings.Contains(lower, "check succeeded") {
 				t.Errorf("startup stderr missing successful connection check: %s", diagnostics)
 			}
@@ -160,28 +172,58 @@ func TestCLIStartupDovecot(t *testing.T) {
 			change: func(body string) string {
 				return strings.Replace(body, "ca_file = "+quoteStartupPath(f.CAFile)+"\n", "", 1)
 			}},
+		{name: "untrusted-auto-starttls", mode: "auto", want: "TLS",
+			change: func(body string) string {
+				return strings.Replace(body, "ca_file = "+quoteStartupPath(f.CAFile)+"\n", "", 1)
+			}},
+		{name: "none-strict-server", mode: "none", want: "authentication"},
+		{name: "quiet-none-strict-server", mode: "none", quiet: true, want: "authentication"},
 		{name: "invalid-mode", mode: "tls", want: "configuration",
 			change: func(body string) string {
 				return strings.Replace(body, `tls = "tls"`, `tls = "plaintext"`, 1)
 			}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			configPath, _ := mcpFixtureConfig(t, f, test.mode, true, "Trash")
+			configPath, cachePath := startupTransportConfig(t, f, test.mode, true)
 			body, err := os.ReadFile(configPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			changed := test.change(string(body))
-			if changed == string(body) {
-				t.Fatal("failure setup did not change configuration")
+			if test.change != nil {
+				changed := test.change(string(body))
+				if changed == string(body) {
+					t.Fatal("failure setup did not change configuration")
+				}
+				writeFixtureFile(t, configPath, []byte(changed))
 			}
-			writeFixtureFile(t, configPath, []byte(changed))
 			args := []string{"--config", configPath}
 			if test.quiet {
 				args = append(args, "--quiet")
 			}
-			assertStartupFailure(t, binary, t.TempDir(), args, test.want, f.Password)
+			diagnostics := assertStartupFailure(t, binary, t.TempDir(), args, test.want, f.Password)
+			if test.quiet && strings.Count(diagnostics, "\n") != 1 {
+				t.Errorf("quiet failure must write only the error: %s", diagnostics)
+			}
+			if strings.HasPrefix(test.name, "untrusted-") && strings.Contains(diagnostics, "transport: ") {
+				t.Errorf("failed TLS handshake claimed an established transport: %s", diagnostics)
+			}
+			if test.name == "invalid-auth" {
+				transportAt := strings.Index(diagnostics, "transport: implicit TLS (verified)")
+				failureAt := strings.Index(diagnostics, "connection check failed")
+				if transportAt < 0 || failureAt < transportAt {
+					t.Errorf("authentication failure missing preceding verified transport: %s", diagnostics)
+				}
+			}
+			if test.mode == "none" {
+				if strings.Contains(strings.ToLower(diagnostics), "verified") {
+					t.Errorf("plaintext authentication failure claimed verified TLS: %s", diagnostics)
+				}
+				if !test.quiet && !strings.Contains(diagnostics, "transport: plaintext") {
+					t.Errorf("plaintext failure missing transport diagnostic: %s", diagnostics)
+				}
+			}
 			assertStartupConnectionReleased(t, f)
+			assertCacheReleased(t, cachePath)
 		})
 	}
 
@@ -326,7 +368,7 @@ func assertStartupProtocolStdout(t *testing.T, output string) {
 	}
 }
 
-func assertStartupFailure(t *testing.T, binary, dir string, args []string, want, password string) {
+func assertStartupFailure(t *testing.T, binary, dir string, args []string, want, password string) string {
 	t.Helper()
 	cmd, cancel := startupCLICommand(t, binary, dir, true, args...)
 	defer cancel()
@@ -353,6 +395,7 @@ func assertStartupFailure(t *testing.T, binary, dir string, args []string, want,
 			t.Error("startup failure exposed configured credentials on stderr")
 		}
 	}
+	return stderr.String()
 }
 
 func assertStartupConnectionReleased(t *testing.T, f *dovecotFixture) {

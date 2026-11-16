@@ -17,6 +17,7 @@ that use the upstream server test harness or external Dovecot are omitted.
 Changed upstream Go source files:
 
 - `imapclient/client.go`: VANISHED dispatch/callback and mailbox wire mode.
+- `imapclient/starttls.go`: public same-client upgrade and decoder-shutdown handling.
 - `internal/imapwire/encoder.go`: raw UTF-8 mailbox names in active modern mode.
 - `internal/imapwire/decoder.go`: mode-aware mailbox decoding.
 
@@ -44,6 +45,21 @@ and `imapclient/mailbox_utf8_test.go` cover both modes and exact LIST, STATUS,
 COPY, APPEND, and MOVE mailbox targets, including responses and commands before
 ENABLE's tagged completion and ignored or rejected ENABLE requests. See
 [`docs/adr/0005-mode-aware-mailbox-names.md`](../../docs/adr/0005-mode-aware-mailbox-names.md).
+
+The STARTTLS patch exposes `Client.StartTLS(*tls.Config) error` after the initial
+greeting, rejecting authenticated clients before sending an upgrade command.
+It upgrades the existing connection, buffered reader, and decoder, keeping the
+command encoder locked through the TLS handshake and preserving capability
+refresh and caller-supplied certificate verification. Capabilities supplied in
+the plaintext STARTTLS completion are discarded and fetched again over TLS.
+The existing `NewStartTLS` constructor retains its private upgrade flow. A truncated or
+malformed tagged OK now returns the decoder error instead of waiting forever
+for an upgrade that cannot run. The added `imapclient/starttls_upgrade_test.go` uses
+independent loopback peers and fresh certificates to cover discovery and
+same-client upgrades, capability invalidation, authentication after TLS,
+greeting/state guards, certificate rejection, handshake serialization, and
+malformed completions. See
+[`docs/adr/0007-imap-transport-modes.md`](../../docs/adr/0007-imap-transport-modes.md).
 
 Run the retained upstream tests and focused regressions from this directory
 with `go test ./...`.

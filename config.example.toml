@@ -7,7 +7,15 @@ host = "imap.example.com"
 port = 993
 username = "user@example.com"
 password = "replace-me"
-tls = "tls" # "starttls" uses port 143 by default.
+# Exact modes: auto (default if omitted), tls, starttls, none.
+# auto/tls default to port 993; starttls/none default to port 143.
+# The explicit port above overrides those defaults.
+# auto on 993 uses verified implicit TLS. On other ports it upgrades only
+# when STARTTLS is advertised; otherwise plaintext is normal.
+# Use tls for a custom implicit-TLS port, or starttls to require an upgrade.
+# none stays plaintext even when STARTTLS is advertised.
+# An attempted TLS upgrade or certificate failure never falls back or retries.
+tls = "auto"
 connect_timeout_seconds = 10
 operation_timeout_seconds = 60
 # ca_file = "private-ca.pem"

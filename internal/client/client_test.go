@@ -142,7 +142,11 @@ func makePeerWithGreeting(t *testing.T, implicit bool, caps, greeting string, be
 					active = secure
 				}
 				p := &testPeer{conn: active, reader: bufio.NewReader(active), writer: bufio.NewWriter(active)}
-				p.send("* %s [CAPABILITY %s] test peer\r\n", greeting, caps)
+				if caps == "" {
+					p.send("* %s test peer\r\n", greeting)
+				} else {
+					p.send("* %s [CAPABILITY %s] test peer\r\n", greeting, caps)
+				}
 				for {
 					line, err := p.reader.ReadString('\n')
 					if err != nil {

@@ -1,4 +1,4 @@
-// Package client adapts verified TLS IMAP sessions to the shared mail contracts.
+// Package client adapts IMAP sessions to the shared mail contracts.
 package client
 
 import (
@@ -24,10 +24,11 @@ func New(cfg *config.Config) *Client { return &Client{cfg: cfg} }
 
 var _ mail.Backend = (*Client)(nil)
 
-// CheckConnection verifies TLS and authentication, then closes the session.
+// CheckConnection resolves transport and verifies authentication, then closes the session.
+// A non-nil callback receives "tls", "starttls", or "none" once before authentication.
 // The startup diagnostic boundary is described in docs/adr/0006-linux-cli-startup-validation.md.
-func (c *Client) CheckConnection(ctx context.Context) error {
-	s, err := c.open(ctx)
+func (c *Client) CheckConnection(ctx context.Context, reportTransport func(string)) error {
+	s, err := c.openWithTransport(ctx, reportTransport)
 	if err != nil {
 		return err
 	}
@@ -66,6 +67,18 @@ func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *Client) open(ctx context.Context) (*session, error) {
+	return c.openWithTransport(ctx, nil)
+}
+
+func initialTransport(mode string, port int) string {
+	// Auto's port boundary is deliberate; see docs/adr/0007-imap-transport-modes.md.
+	if mode == "auto" && port == 993 {
+		return "tls"
+	}
+	return mode
+}
+
+func (c *Client) openWithTransport(ctx context.Context, reportTransport func(string)) (*session, error) {
 	cfg := c.cfg.IMAP()
 	ctx, cancel := context.WithTimeout(ctx, cfg.OperationTimeout())
 	raw, err := (&net.Dialer{Timeout: cfg.ConnectTimeout()}).DialContext(ctx, "tcp", net.JoinHostPort(cfg.Host(), strconv.Itoa(cfg.Port())))
@@ -80,14 +93,18 @@ func (c *Client) open(ctx context.Context) (*session, error) {
 	conn := &deadlineConn{Conn: raw, deadline: deadline}
 	_ = conn.SetDeadline(deadline)
 	opts := &imapclient.Options{TLSConfig: cfg.TLSConfig()}
-	if cfg.TLS() == "starttls" {
+	mode := initialTransport(cfg.TLS(), cfg.Port())
+	switch mode {
+	case "starttls":
 		s.c, err = imapclient.NewStartTLS(conn, opts)
-	} else {
+	case "tls":
 		secure := tls.Client(conn, cfg.TLSConfig())
 		err = secure.HandshakeContext(ctx)
 		if err == nil {
 			s.c = imapclient.New(secure, opts)
 		}
+	default:
+		s.c = imapclient.New(conn, opts)
 	}
 	if err != nil {
 		failure := safeError(ctx, err, "tls_failed", false)
@@ -99,8 +116,37 @@ func (c *Client) open(ctx context.Context) (*session, error) {
 		s.close()
 		return nil, failure
 	}
+	caps := s.c.Caps()
+	if caps == nil {
+		failure := s.err(errors.New("IMAP capability discovery failed"), false)
+		s.close()
+		return nil, failure
+	}
+	if mode == "auto" {
+		mode = "none"
+		if caps.Has(imap.CapStartTLS) {
+			if s.c.State() != imap.ConnStateNotAuthenticated {
+				s.close()
+				return nil, mail.NewError("tls_failed", "Cannot establish verified TLS with the IMAP server")
+			}
+			if err = s.c.StartTLS(cfg.TLSConfig()); err != nil {
+				failure := safeError(ctx, err, "tls_failed", false)
+				s.close()
+				return nil, failure
+			}
+			mode = "starttls"
+			caps = s.c.Caps()
+			if caps == nil {
+				failure := s.err(errors.New("IMAP capability discovery failed"), false)
+				s.close()
+				return nil, failure
+			}
+		}
+	}
+	if reportTransport != nil {
+		reportTransport(mode)
+	}
 	if s.c.State() == imap.ConnStateNotAuthenticated {
-		caps := s.c.Caps()
 		if caps.Has(imap.AuthCap("PLAIN")) {
 			err = s.c.Authenticate(sasl.NewPlainClient("", cfg.Username(), cfg.Password()))
 		} else if !caps.Has(imap.CapLoginDisabled) {

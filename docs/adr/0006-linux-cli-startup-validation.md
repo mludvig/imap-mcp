@@ -4,6 +4,10 @@
 
 Accepted and verified on 2026-11-17 by build, unit, race, vet, and Dovecot integration checks.
 
+The TLS-only policy is superseded by [ADR 0007](0007-imap-transport-modes.md);
+configuration discovery, diagnostics, startup-session closure, and readiness
+validation remain in force.
+
 ## Context
 
 Requiring an absolute `--config` path adds setup friction, while serving MCP before checking IMAP can report readiness with an unusable TLS mode or account. Operators need startup progress without corrupting stdio JSON-RPC or disclosing credentials and mail.

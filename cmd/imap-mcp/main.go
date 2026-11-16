@@ -29,7 +29,9 @@ func main() {
 
 func run(ctx context.Context, args []string, stderr io.Writer) int {
 	return runWithHooks(ctx, args, stderr,
-		func(ctx context.Context, cfg *config.Config) error { return client.New(cfg).CheckConnection(ctx) },
+		func(ctx context.Context, cfg *config.Config, reportTransport func(string)) error {
+			return client.New(cfg).CheckConnection(ctx, reportTransport)
+		},
 		func(ctx context.Context, svc *service.Service) error {
 			return server.New(svc).Run(ctx, &mcp.StdioTransport{})
 		})
@@ -37,7 +39,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 
 // Only network probing and MCP serving are replaced in CLI tests.
 func runWithHooks(ctx context.Context, args []string, stderr io.Writer,
-	probe func(context.Context, *config.Config) error,
+	probe func(context.Context, *config.Config, func(string)) error,
 	serve func(context.Context, *service.Service) error,
 ) (code int) {
 	flags := flag.NewFlagSet("imap-mcp", flag.ContinueOnError)
@@ -139,7 +141,16 @@ func runWithHooks(ctx context.Context, args []string, stderr io.Writer,
 	started = time.Now()
 	log.info("checking IMAP connection")
 	probeCtx, cancel := context.WithTimeout(ctx, cfg.IMAP().OperationTimeout())
-	err = probe(probeCtx, cfg)
+	err = probe(probeCtx, cfg, func(transport string) {
+		switch transport {
+		case "tls":
+			log.info("transport: implicit TLS (verified)")
+		case "starttls":
+			log.info("transport: STARTTLS (verified)")
+		case "none":
+			log.info("transport: plaintext")
+		}
+	})
 	cancel()
 	log.timing("IMAP connection check", started)
 	if err != nil {

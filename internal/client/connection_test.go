@@ -25,6 +25,10 @@ func requireDisconnected(t *testing.T, peer *peerServer) {
 
 func upgradePeer(p *testPeer, cfg *tls.Config) {
 	p.ok()
+	handshakePeer(p, cfg)
+}
+
+func handshakePeer(p *testPeer, cfg *tls.Config) {
 	secure := tls.Server(p.conn, cfg)
 	if secure.Handshake() != nil {
 		return
@@ -59,7 +63,7 @@ func TestCheckConnectionAuthenticatesAndClosesWithoutMailboxCommands(t *testing.
 					return true
 				})
 				client := New(peer.config(t, false, true, mode))
-				if err := client.CheckConnection(context.Background()); err != nil {
+				if err := client.CheckConnection(context.Background(), nil); err != nil {
 					t.Fatal(err)
 				}
 				requireDisconnected(t, peer)
@@ -106,7 +110,7 @@ func TestCheckConnectionTLSFailuresCloseWithoutAuthentication(t *testing.T) {
 				p.send("%s NO fixture-secret testuser private-host rejected\r\n", p.tag)
 				return true
 			})
-			err := New(peer.config(t, true, test.trust, test.mode)).CheckConnection(context.Background())
+			err := New(peer.config(t, true, test.trust, test.mode)).CheckConnection(context.Background(), nil)
 			if typed := requireCode(t, err, "tls_failed"); typed.Message != test.message {
 				t.Fatalf("message = %q, want %q", typed.Message, test.message)
 			}
@@ -140,7 +144,7 @@ func TestCheckConnectionAuthenticationFailureIsSanitized(t *testing.T) {
 				p.send("%s NO fixture-secret testuser private-host invalid credentials\r\n", p.tag)
 				return true
 			}, nil)
-			err := New(peer.config(t, true, true, "tls")).CheckConnection(context.Background())
+			err := New(peer.config(t, true, true, "tls")).CheckConnection(context.Background(), nil)
 			if typed := requireCode(t, err, "authentication_failed"); typed.Message != "IMAP authentication failed" {
 				t.Fatalf("authentication response exposed: %q", typed.Message)
 			}
@@ -178,7 +182,7 @@ func TestCheckConnectionCancellationAndDeadlineCloseSession(t *testing.T) {
 				defer cancel()
 				result := make(chan error, 1)
 				client := New(peer.config(t, true, true, mode))
-				go func() { result <- client.CheckConnection(ctx) }()
+				go func() { result <- client.CheckConnection(ctx, nil) }()
 				select {
 				case <-entered:
 				case <-time.After(time.Second):
@@ -213,7 +217,7 @@ func TestCheckConnectionRefusesPlaintextPREAUTH(t *testing.T) {
 		upgradePeer(p, peer.tlsConfig)
 		return true
 	})
-	err := New(peer.config(t, true, true, "starttls")).CheckConnection(context.Background())
+	err := New(peer.config(t, true, true, "starttls")).CheckConnection(context.Background(), nil)
 	if typed := requireCode(t, err, "tls_failed"); typed.Message != "Cannot establish verified TLS with the IMAP server" {
 		t.Fatalf("message = %q", typed.Message)
 	}

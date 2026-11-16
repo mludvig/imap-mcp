@@ -10,7 +10,7 @@ TOML configuration defaults to readonly; service and client reject writes using 
 
 ## Why
 
-See [ADR 0001](../adr/0001-go-stdio-startup-policy.md), [ADR 0003](../adr/0003-safe-imap-operations.md), and [ADR 0004](../adr/0004-backport-imap4rev2-vanished.md).
+See [ADR 0001](../adr/0001-go-stdio-startup-policy.md), [ADR 0003](../adr/0003-safe-imap-operations.md), [ADR 0004](../adr/0004-backport-imap4rev2-vanished.md), and [ADR 0007](../adr/0007-imap-transport-modes.md).
 
 ## Where it lives
 
@@ -18,11 +18,17 @@ See [ADR 0001](../adr/0001-go-stdio-startup-policy.md), [ADR 0003](../adr/0003-s
 
 `third_party/go-imap/imapclient/client.go`: VANISHED dispatch and `UnilateralDataHandler.Vanished`; `third_party/go-imap/imapclient/vanished.go`: `Client.handleVanished` and `UnilateralDataVanished`. `go.mod` selects the local replacement; the subtree retains the upstream MIT `LICENSE`.
 
+`third_party/go-imap/imapclient/starttls.go`: the local public `Client.StartTLS` upgrade on the existing client after capability discovery.
+
 ## Invariants & gotchas
 
 No read path may set Seen, and no command may add Deleted or send EXPUNGE, UID EXPUNGE, or CLOSE; teardown closes the connection directly. Gate native MOVE before invoking beta.9's unsafe fallback, and do not expose QRESYNC, background IDLE, conditional STORE, BINARY retrieval, partial body fetches, saved-search handles, or mutation replay. Connections belong to individual operations; the service holds one account lock across refresh/lookup and invalidation/mutation, while direct reads own independent connections and epoch checks.
 
 Generic transfers never create destinations; Trash rejects already-in-Trash references and a Noselect destination, and matches mailbox spelling exactly except INBOX. Both affected mailboxes are invalidated before Trash capability/list/create calls, including ambiguous creation failures, and the client independently gates native MOVE immediately before the upstream call.
+
+`auto` is the default, using verified implicit TLS only on numeric port 993; every other port starts with a plaintext greeting/capabilities and upgrades the same client only when STARTTLS is advertised. Absent advertisement means a normal plaintext session; use explicit `tls` for custom implicit-TLS ports, `starttls` to require an upgrade, or `none` to remain plaintext even when STARTTLS is advertised.
+
+Complete any required or advertised upgrade before sending client authentication; a STARTTLS or certificate failure closes the session without plaintext fallback or another connection attempt. Reject plaintext PREAUTH for required STARTTLS or `auto` with advertised STARTTLS; `none` and unadvertised `auto` accept PREAUTH as already authenticated.
 
 ## beta.9 workarounds
 

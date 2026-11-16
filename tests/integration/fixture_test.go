@@ -59,6 +59,16 @@ type observedMessage struct {
 
 func startDovecot(t *testing.T, rev2 bool) *dovecotFixture {
 	t.Helper()
+	return startDovecotFixture(t, rev2, false)
+}
+
+func startPlaintextDovecot(t *testing.T) *dovecotFixture {
+	t.Helper()
+	return startDovecotFixture(t, false, true)
+}
+
+func startDovecotFixture(t *testing.T, rev2, allowCleartext bool) *dovecotFixture {
+	t.Helper()
 	docker(t, "info", "--format", "{{.ServerVersion}}")
 	dir := t.TempDir()
 	// The image runs as UID 1000; these generated fixture credentials and keys
@@ -82,6 +92,18 @@ func startDovecot(t *testing.T, rev2 bool) *dovecotFixture {
 	}
 	if !rev2 {
 		conf = []byte(strings.ReplaceAll(string(conf), "imap4rev2_enable = yes", "imap4rev2_enable = no"))
+	}
+	if allowCleartext {
+		// Only this generated, loopback-bound fixture permits plaintext login.
+		for _, setting := range [][2]string{
+			{"ssl = required", "ssl = yes"},
+			{"auth_allow_cleartext = no", "auth_allow_cleartext = yes"},
+		} {
+			if strings.Count(string(conf), setting[0]) != 1 {
+				t.Fatalf("plaintext fixture requires exactly one %q", setting[0])
+			}
+			conf = []byte(strings.Replace(string(conf), setting[0], setting[1], 1))
+		}
 	}
 	writeFixtureFile(t, filepath.Join(dir, "dovecot.conf"), conf)
 	writeFixtureFile(t, filepath.Join(dir, "users"), []byte(f.Username+":{PLAIN}"+f.Password+":1000:1000::/srv/vmail/fixture::\n"))
