@@ -1,0 +1,18 @@
+# Set readonly = false and restart to expose mutation tools.
+readonly = true
+trash_mailbox = "Trash"
+
+[imap]
+host = "imap.example.com"
+port = 993
+username = "user@example.com"
+password = "replace-me"
+tls = "tls" # "starttls" uses port 143 by default.
+connect_timeout_seconds = 10
+operation_timeout_seconds = 60
+# ca_file = "private-ca.pem"
+
+[cache]
+# Empty uses the OS user cache directory: imap-mcp/headers.sqlite3.
+# Relative paths resolve beside this configuration file.
+path = ""

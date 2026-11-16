@@ -17,11 +17,13 @@ import (
 type Config struct {
 	readonly     bool
 	trashMailbox string
+	cachePath    string
 	imap         IMAPConfig
 }
 
 func (c *Config) Readonly() bool       { return c.readonly }
 func (c *Config) TrashMailbox() string { return c.trashMailbox }
+func (c *Config) CachePath() string    { return c.cachePath }
 func (c *Config) IMAP() IMAPConfig     { return c.imap }
 
 // IMAPConfig holds connection settings. TLSConfig returns a separate mutable copy.
@@ -61,7 +63,10 @@ func (c IMAPConfig) TLSConfig() *tls.Config {
 type fileConfig struct {
 	Readonly     *bool   `toml:"readonly"`
 	TrashMailbox *string `toml:"trash_mailbox"`
-	IMAP         struct {
+	Cache        struct {
+		Path string `toml:"path"`
+	} `toml:"cache"`
+	IMAP struct {
 		Host                    string  `toml:"host"`
 		Port                    *int    `toml:"port"`
 		Username                string  `toml:"username"`
@@ -161,6 +166,17 @@ func Load(path string) (*Config, error) {
 		if !imap.rootCAs.AppendCertsFromPEM(pem) {
 			return nil, errors.New("imap.ca_file contains no valid certificates")
 		}
+	}
+	cfg.cachePath = input.Cache.Path
+	if cfg.cachePath == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return nil, errors.New("cannot resolve user cache directory; set cache.path explicitly")
+		}
+		cfg.cachePath = filepath.Join(cacheDir, "imap-mcp", "headers.sqlite3")
+	}
+	if !filepath.IsAbs(cfg.cachePath) {
+		cfg.cachePath = filepath.Join(filepath.Dir(path), cfg.cachePath)
 	}
 	return cfg, nil
 }

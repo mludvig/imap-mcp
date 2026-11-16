@@ -38,6 +38,13 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	imap := cfg.IMAP()
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CachePath() != filepath.Join(cacheDir, "imap-mcp", "headers.sqlite3") {
+		t.Fatalf("unexpected cache path default: %q", cfg.CachePath())
+	}
 	if !cfg.Readonly() || cfg.TrashMailbox() != "Trash" {
 		t.Fatalf("unexpected policy defaults: readonly=%v trash=%q", cfg.Readonly(), cfg.TrashMailbox())
 	}
@@ -60,6 +67,61 @@ func TestLoadDefaults(t *testing.T) {
 	next := cfg.IMAP().TLSConfig()
 	if next.MinVersion != tls.VersionTLS12 || next.ServerName != imap.Host() || next.InsecureSkipVerify {
 		t.Fatal("mutating TLS settings changed the startup snapshot")
+	}
+}
+
+func TestLoadCachePaths(t *testing.T) {
+	absolute := filepath.Join(t.TempDir(), "headers.sqlite3")
+	for _, tt := range []struct {
+		name string
+		path string
+	}{
+		{"relative", "cache/headers.sqlite3"},
+		{"absolute", absolute},
+		{"empty", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := writeConfig(t, credentials+"\n[cache]\npath = "+strconv.Quote(tt.path)+"\n")
+			cfg, err := Load(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := tt.path
+			if want == "" {
+				cacheDir, err := os.UserCacheDir()
+				if err != nil {
+					t.Fatal(err)
+				}
+				want = filepath.Join(cacheDir, "imap-mcp", "headers.sqlite3")
+			} else if !filepath.IsAbs(want) {
+				want = filepath.Join(filepath.Dir(configPath), want)
+			}
+			if cfg.CachePath() != want {
+				t.Fatalf("cache path = %q, want %q", cfg.CachePath(), want)
+			}
+			if err := os.WriteFile(configPath, []byte(credentials+"\n[cache]\npath = \"replacement.sqlite3\"\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if cfg.CachePath() != want {
+				t.Fatal("config file changes affected the loaded cache path")
+			}
+		})
+	}
+}
+
+func TestLoadEmptyCacheTable(t *testing.T) {
+	if _, err := Load(writeConfig(t, credentials+"\n[cache]\n")); err != nil {
+		t.Fatalf("empty cache table must use the default path: %v", err)
+	}
+}
+
+func TestLoadExample(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.example.toml"))
+	if err != nil {
+		t.Fatalf("example configuration is invalid: %v", err)
+	}
+	if !cfg.Readonly() || cfg.TrashMailbox() != "Trash" || cfg.CachePath() == "" {
+		t.Fatal("example must retain readonly and persistent-cache defaults")
 	}
 }
 
@@ -104,8 +166,11 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		want    string
 	}{
 		{"unknown root", "cache_path = \"private-password\"\n" + credentials, "unknown keys"},
-		{"unknown table", credentials + "\n[cache]\npath = \"headers.db\"\n", "unknown keys"},
-		{"unknown empty table", credentials + "\n[cache]\n", "unknown keys"},
+		{"unknown table", credentials + "\n[storage]\npath = \"headers.db\"\n", "unknown keys"},
+		{"unknown empty table", credentials + "\n[storage]\n", "unknown keys"},
+		{"unknown cache", credentials + "\n[cache]\nkey = \"private-password\"\n", "unknown keys"},
+		{"unknown cache nested table", credentials + "\n[cache.extra]\n", "unknown keys"},
+		{"invalid cache path type", credentials + "\n[cache]\npath = false\n", "field type"},
 		{"unknown nested table", credentials + "\n[imap.extra]\n", "unknown keys"},
 		{"unknown imap", credentials + "insecure_skip_verify = true", "unknown keys"},
 		{"invalid readonly type", "readonly = \"false\"\n" + credentials, "field type"},
