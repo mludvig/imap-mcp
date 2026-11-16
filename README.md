@@ -429,3 +429,6 @@ The [architecture decisions](docs/adr/0001-go-stdio-startup-policy.md),
 [message identity](docs/concepts/message-identity.md),
 [IMAP safety](docs/concepts/imap-safety.md), and
 [stdio contract](docs/concepts/stdio-mcp.md) describe the load-bearing invariants.
+
+See [mail-search lessons](docs/notes/mail-search-lessons.md) for observations and
+proposed improvements from actual stdio and native Codex/MCP searches.
