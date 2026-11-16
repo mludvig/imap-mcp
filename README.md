@@ -11,8 +11,9 @@ Install Go **1.25 or newer**, then run from this checkout:
 
 ```sh
 make build
-install -d -m 700 "$HOME/.config/imap-mcp"
-install -m 600 config.example.toml "$HOME/.config/imap-mcp/config.toml"
+imap_mcp_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/imap-mcp"
+install -d -m 700 "$imap_mcp_config_dir"
+install -m 600 config.example.toml "$imap_mcp_config_dir/config.toml"
 ```
 
 The binary is `bin/imap-mcp`. Edit the private copy of
@@ -38,24 +39,62 @@ operation_timeout_seconds = 60
 path = "headers.sqlite3"
 ```
 
-`tls = "tls"` uses implicit TLS, default port 993. For required STARTTLS, set
-`tls = "starttls"` and port 143, or omit `port` to use that mode's default.
+`tls = "tls"` uses implicit TLS, default port 993. `tls = "starttls"` requires
+STARTTLS, default port 143. Verify which mode the server offers on the chosen
+port before changing either setting; an explicit `port` overrides the mode's
+default.
 Both modes verify the certificate and hostname; a failed STARTTLS or verification
-fails the connection. There is no insecure mode. `ca_file` adds a private CA to
-the system trust roots.
+fails the connection. There is no automatic fallback or insecure mode.
+`ca_file` adds a private CA to the system trust roots.
 
 Relative `cache.path` and `imap.ca_file` paths resolve beside the TOML file.
 An empty cache path uses the OS user cache directory at
 `imap-mcp/headers.sqlite3`. Unknown configuration keys are errors.
 
-Start the stdio server with an **absolute** configuration path:
+Start the stdio server with the default configuration:
+
+```sh
+./bin/imap-mcp
+```
+
+The default is `os.UserConfigDir()/imap-mcp/config.toml`: on Linux,
+`$XDG_CONFIG_HOME/imap-mcp/config.toml` when `XDG_CONFIG_HOME` is nonempty, otherwise
+`$HOME/.config/imap-mcp/config.toml`. `--config` overrides discovery and accepts
+either an absolute path or a path relative to the process's working directory:
 
 ```sh
 /absolute/path/to/imap-mcp/bin/imap-mcp --config /absolute/path/to/config.toml
+./bin/imap-mcp --config ./private-config.toml
 ```
 
 Normally your MCP client starts this process. Standard output carries MCP
-JSON-RPC; diagnostics use standard error. Configuration is loaded once.
+JSON-RPC; help and diagnostics use standard error. `-h` or `--help` prints the
+full usage and options without loading configuration or connecting.
+
+| Verbosity | Diagnostics on stderr |
+| --- | --- |
+| Default | Resolved config/cache paths, readonly mode, connection-check progress, readiness |
+| `--quiet` | Errors only |
+| `--verbose` | Default output plus lifecycle detail |
+| `--debug` | Verbose output plus fixed startup stages and timings |
+
+The enabled `--quiet`, `--verbose`, and `--debug` modes are pairwise mutually
+exclusive. Debug output includes no raw IMAP traffic, credentials, or message
+contents.
+
+Startup loads the configuration, opens the cache, and checks a verified TLS IMAP
+session through authentication before serving MCP. The check uses
+`connect_timeout_seconds` and `operation_timeout_seconds`, closes its session,
+and only then reports readiness; later tool calls open their own sessions.
+A failed check exits with status 1 instead of advertising offline readiness.
+
+| Exit status | Meaning |
+| --- | --- |
+| 0 | Help, normal stdio EOF, or SIGINT/SIGTERM shutdown |
+| 1 | Configuration, cache, startup connection check, or stdio server failure |
+| 2 | Invalid arguments, including conflicting verbosity modes |
+
+Configuration is loaded once.
 `readonly` defaults to `true`, exposes only the eight read tools, and still
 allows local cache writes. Set it to `false` and restart the server process to
 enable the six write tools. Editing a running process's config changes neither
@@ -342,8 +381,9 @@ Each fixture uses synthetic mail and credentials, random ports bound to
 127.0.0.1, an owned container/volume, and registered cleanup. See the
 [reproducible testbed](testbed/README.md) for setup and fixture details.
 
-The build, root and local-module unit, race, and vet checks, and complete Dovecot
-integration suite passed on 2026-11-16 with Go 1.25.14, including the mailbox
+Before the CLI startup changes, the build, root and local-module unit, race, and
+vet checks, and complete Dovecot integration suite passed on 2026-11-16 with
+Go 1.25.14, including the mailbox
 codec and THREAD contract regressions. Independent `doveadm` checks distinguish
 `R&D`, `R&-D`, literal `&AOk-`, and Unicode mailbox names, verify COPY/APPEND/MOVE
 target contents and exact Trash creation, and detect unexpected mailboxes.
@@ -353,7 +393,13 @@ THREAD checks cover the criteria-only input schema, recursive result schema,
 rejected paging/sorting controls, complete 201-root results on both protocol
 revisions, header narrowing, and explicit rejection of oversized complete trees.
 
+The CLI changes passed build, unit, race, vet, and the complete Dovecot
+integration suite on 2026-11-17 with Go 1.25.14. Regressions cover configuration
+discovery, verbosity, startup authentication/TLS failures, connection release,
+timeouts, cancellation, and stdout JSON-RPC purity.
+
 The [architecture decisions](docs/adr/0001-go-stdio-startup-policy.md),
+[Linux CLI startup decision](docs/adr/0006-linux-cli-startup-validation.md),
 [cache coherence](docs/concepts/cache-coherence.md),
 [message identity](docs/concepts/message-identity.md),
 [IMAP safety](docs/concepts/imap-safety.md), and

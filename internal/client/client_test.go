@@ -60,14 +60,15 @@ func (p *testPeer) fetchLiteral(seq, uid uint32, section, body string) {
 }
 
 type peerServer struct {
-	listener    net.Listener
-	tlsConfig   *tls.Config
-	caPath      string
-	mu          sync.Mutex
-	commands    []string
-	connections int
-	conns       []net.Conn
-	wg          sync.WaitGroup
+	listener     net.Listener
+	tlsConfig    *tls.Config
+	caPath       string
+	mu           sync.Mutex
+	commands     []string
+	connections  int
+	conns        []net.Conn
+	wg           sync.WaitGroup
+	disconnected chan struct{}
 }
 
 func (s *peerServer) record(command string) {
@@ -81,6 +82,10 @@ func (s *peerServer) snapshot() ([]string, int) {
 	return append([]string{}, s.commands...), s.connections
 }
 func makePeer(t *testing.T, implicit bool, caps string, handler func(*testPeer) bool) *peerServer {
+	t.Helper()
+	return makePeerWithGreeting(t, implicit, caps, "OK", nil, handler)
+}
+func makePeerWithGreeting(t *testing.T, implicit bool, caps, greeting string, before func(*testPeer) bool, handler func(*testPeer) bool) *peerServer {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -101,7 +106,7 @@ func makePeer(t *testing.T, implicit bool, caps string, handler func(*testPeer) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &peerServer{listener: listener, tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, caPath: filepath.Join(t.TempDir(), "ca.pem")}
+	s := &peerServer{listener: listener, tlsConfig: &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, caPath: filepath.Join(t.TempDir(), "ca.pem"), disconnected: make(chan struct{}, 1)}
 	if err := os.WriteFile(s.caPath, certPEM, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +125,12 @@ func makePeer(t *testing.T, implicit bool, caps string, handler func(*testPeer) 
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
+				defer func() {
+					select {
+					case s.disconnected <- struct{}{}:
+					default:
+					}
+				}()
 				defer conn.Close()
 				_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 				active := conn
@@ -131,7 +142,7 @@ func makePeer(t *testing.T, implicit bool, caps string, handler func(*testPeer) 
 					active = secure
 				}
 				p := &testPeer{conn: active, reader: bufio.NewReader(active), writer: bufio.NewWriter(active)}
-				p.send("* OK [CAPABILITY %s] test peer\r\n", caps)
+				p.send("* %s [CAPABILITY %s] test peer\r\n", greeting, caps)
 				for {
 					line, err := p.reader.ReadString('\n')
 					if err != nil {
@@ -148,6 +159,9 @@ func makePeer(t *testing.T, implicit bool, caps string, handler func(*testPeer) 
 						p.args = parts[2]
 					}
 					s.record(p.command + " " + p.args)
+					if before != nil && before(p) {
+						continue
+					}
 					switch p.command {
 					case "CAPABILITY":
 						p.send("* CAPABILITY %s\r\n", caps)

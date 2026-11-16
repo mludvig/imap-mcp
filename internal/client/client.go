@@ -4,6 +4,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net"
 	"sort"
@@ -22,6 +23,17 @@ type Client struct{ cfg *config.Config }
 func New(cfg *config.Config) *Client { return &Client{cfg: cfg} }
 
 var _ mail.Backend = (*Client)(nil)
+
+// CheckConnection verifies TLS and authentication, then closes the session.
+// The startup diagnostic boundary is described in docs/adr/0006-linux-cli-startup-validation.md.
+func (c *Client) CheckConnection(ctx context.Context) error {
+	s, err := c.open(ctx)
+	if err != nil {
+		return err
+	}
+	s.close()
+	return nil
+}
 
 // Each operation owns a connection. Cancellation closes the raw socket, even
 // during TLS/literal I/O; see docs/concepts/imap-safety.md.
@@ -161,6 +173,23 @@ func safeError(ctx context.Context, err error, fallback string, write bool) erro
 		msg = "Cannot connect to the IMAP server"
 	case "tls_failed":
 		msg = "Cannot establish verified TLS with the IMAP server"
+		var recordHeader tls.RecordHeaderError
+		var unknownAuthority x509.UnknownAuthorityError
+		var hostname x509.HostnameError
+		var certificateInvalid x509.CertificateInvalidError
+		switch {
+		case errors.As(err, &recordHeader) && string(recordHeader.RecordHeader[:]) == "* OK ":
+			msg = "IMAP endpoint speaks plaintext; configure STARTTLS or use an implicit-TLS port"
+		case errors.As(err, &unknownAuthority):
+			msg = "IMAP server certificate is signed by an unknown authority"
+		case errors.As(err, &hostname):
+			msg = "IMAP server certificate does not match the configured hostname"
+		case errors.As(err, &certificateInvalid) && certificateInvalid.Reason == x509.Expired:
+			msg = "IMAP server certificate has expired"
+			if certificateInvalid.Cert != nil && time.Now().Before(certificateInvalid.Cert.NotBefore) {
+				msg = "IMAP server certificate is not yet valid"
+			}
+		}
 	case "authentication_failed":
 		msg = "IMAP authentication failed"
 	}
