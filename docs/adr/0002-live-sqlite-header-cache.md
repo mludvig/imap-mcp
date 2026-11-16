@@ -4,6 +4,8 @@
 
 Accepted.
 
+Raw-header persistence is superseded by [ADR 0008](0008-decoded-header-cache.md); live refresh, consistency, and cache ownership remain in force.
+
 ## Context
 
 Repeated mailbox listings and header searches should avoid repeatedly downloading unchanged headers while still consulting the IMAP server. An in-memory cache loses this work on restart; storing bodies or serving an offline snapshot would enlarge both the privacy footprint and the consistency contract.

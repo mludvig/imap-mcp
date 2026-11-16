@@ -9,6 +9,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/mludvig/imap-mcp/internal/diagnostics"
 	"github.com/mludvig/imap-mcp/internal/mail"
 )
 
@@ -25,6 +26,8 @@ type fetched struct {
 // Sequence FETCH avoids beta.9's UID-before-literal assumption. Consumers must
 // verify the returned UID; see docs/concepts/imap-safety.md.
 func (s *session) fetch(set imap.NumSet, opts *imap.FetchOptions, section *imap.FetchItemBodySection, maxBytes int64) ([]fetched, error) {
+	diagnostics.Stage(s.ctx, "Fetching IMAP messages")
+	defer diagnostics.Measure(s.ctx, "IMAP fetch")()
 	cmd := s.c.Fetch(set, opts)
 	defer cmd.Close()
 	result := []fetched{}
@@ -122,10 +125,12 @@ func (s *session) fetch(set imap.NumSet, opts *imap.FetchOptions, section *imap.
 // literal discard. Wait before that retry to avoid concurrent bufio access.
 // See docs/concepts/imap-safety.md.
 func (s *session) failedLiteral() {
+	s.invalid = true
 	_ = s.raw.Close()
 	<-s.c.Closed()
 }
 func (s *session) abandonLiteral(literal imap.LiteralReader) {
+	s.invalid = true
 	_ = s.raw.Close()
 	_, _ = io.Copy(io.Discard, literal)
 	<-s.c.Closed()
@@ -183,6 +188,8 @@ func (c *Client) Refresh(ctx context.Context, name string, cached mail.CacheStat
 		return mail.Refresh{}, err
 	}
 	defer s.close()
+	diagnostics.Stage(s.ctx, "Synchronizing mailbox")
+	defer diagnostics.Measure(s.ctx, "IMAP mailbox synchronization")()
 	selected, err := s.selectMailbox(name, true)
 	if err != nil {
 		return mail.Refresh{}, err

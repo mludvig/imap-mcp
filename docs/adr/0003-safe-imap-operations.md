@@ -4,6 +4,8 @@
 
 Accepted.
 
+Per-operation connection ownership is superseded by [ADR 0009](0009-serialized-runtime-connection.md); the read, deletion, capability, and mutation-replay policies remain in force.
+
 ## Context
 
 Reading a message must not change its Seen flag, and moving to configured Trash must not introduce a permanent-delete operation. A server advertising an extension does not mean this implementation can safely expose every operation it enables.

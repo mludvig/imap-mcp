@@ -162,7 +162,7 @@ func TestRollbackAndHeaderReuse(t *testing.T) {
 	if p := query(t, c, key, mail.SearchQuery{}); p.UIDValidity != 1 || len(p.Messages) != 2 || p.Messages[1].Subject != "original" {
 		t.Fatalf("SQL failure did not roll back epoch reset: %+v", p)
 	}
-	if _, err := c.db.Exec(`DROP TRIGGER reject_insert; CREATE TRIGGER immutable_header BEFORE UPDATE OF header ON messages BEGIN SELECT RAISE(ABORT, 'header rewritten'); END`); err != nil {
+	if _, err := c.db.Exec(`DROP TRIGGER reject_insert; CREATE TRIGGER immutable_header BEFORE UPDATE OF headers ON messages BEGIN SELECT RAISE(ABORT, 'headers rewritten'); END`); err != nil {
 		t.Fatal(err)
 	}
 	apply(t, c, key, mail.Refresh{UIDValidity: 1, HighestModSeq: 7, Members: []uint32{1}, FlagUpdates: []mail.FlagUpdate{{UID: 1, Flags: []string{}, ModSeq: 7}}})
@@ -170,9 +170,8 @@ func TestRollbackAndHeaderReuse(t *testing.T) {
 	if len(p.Messages) != 1 || p.Messages[0].Subject != "original" || len(p.Messages[0].Flags) != 0 || p.Messages[0].ModSeq != 7 {
 		t.Fatalf("incremental removal/flags: %+v", p)
 	}
-	var raw []byte
-	if err := c.db.QueryRow(`SELECT header FROM messages WHERE account='one' AND mailbox='INBOX' AND uid=1`).Scan(&raw); err != nil || string(raw) != string(original.Header) {
-		t.Fatalf("raw header changed: %q, %v", raw, err)
+	if got := query(t, c, key, mail.SearchQuery{Headers: map[string]string{"subject": "original"}}); got.Total != 1 {
+		t.Fatalf("decoded header changed: %+v", got)
 	}
 }
 

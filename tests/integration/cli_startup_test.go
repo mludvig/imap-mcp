@@ -100,9 +100,10 @@ func TestCLIStartupDovecot(t *testing.T) {
 			assertStartupConnectionReleased(t, f)
 			if test.mode == "auto" || test.mode == "" {
 				assertStartupMailboxStatus(t, p, f)
-				assertStartupConnectionReleased(t, f)
+				assertRuntimeConnection(t, f)
 			}
 			p.close(t)
+			assertStartupConnectionReleased(t, f)
 			assertStartupProtocolStdout(t, p.stdout.String())
 			assertCacheReleased(t, cachePath)
 			diagnostics := p.stderr.String()
@@ -215,7 +216,7 @@ func TestCLIStartupDovecot(t *testing.T) {
 				}
 			}
 			if test.mode == "none" {
-				if strings.Contains(strings.ToLower(diagnostics), "verified") {
+				if strings.Contains(strings.ToLower(diagnostics), "(verified)") {
 					t.Errorf("plaintext authentication failure claimed verified TLS: %s", diagnostics)
 				}
 				if !test.quiet && !strings.Contains(diagnostics, "transport: plaintext") {

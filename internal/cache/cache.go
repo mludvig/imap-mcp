@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/gofrs/flock"
+	"github.com/mludvig/imap-mcp/internal/diagnostics"
 	"github.com/mludvig/imap-mcp/internal/mail"
 	_ "modernc.org/sqlite"
 )
@@ -29,6 +30,13 @@ type Cache struct {
 // Open takes an exclusive process lock before accessing the private database.
 // Existing parent directories retain their owner's chosen permissions.
 func Open(path string) (*Cache, error) {
+	return OpenContext(context.Background(), path)
+}
+
+// OpenContext attaches cache initialization and rebuild diagnostics to ctx.
+func OpenContext(ctx context.Context, path string) (*Cache, error) {
+	diagnostics.Stage(ctx, "Opening header cache")
+	defer diagnostics.Measure(ctx, "cache open")()
 	if path == "" || path == ":memory:" {
 		return nil, errors.New("cache requires a persistent file path")
 	}
@@ -62,18 +70,7 @@ func Open(path string) (*Cache, error) {
 	}
 	// One connection also keeps PRAGMA settings and multi-query snapshots coherent.
 	c.db.SetMaxOpenConns(1)
-	_, err = c.db.Exec(`PRAGMA foreign_keys = ON;
-CREATE TABLE IF NOT EXISTS mailboxes (
- account TEXT NOT NULL, name TEXT NOT NULL,
- uid_validity INTEGER NOT NULL, highest_mod_seq TEXT NOT NULL,
- PRIMARY KEY(account, name)
-);
-CREATE TABLE IF NOT EXISTS messages (
- account TEXT NOT NULL, mailbox TEXT NOT NULL, uid INTEGER NOT NULL,
- header BLOB NOT NULL, summary BLOB NOT NULL, headers BLOB NOT NULL,
- PRIMARY KEY(account, mailbox, uid),
- FOREIGN KEY(account, mailbox) REFERENCES mailboxes(account, name) ON DELETE CASCADE
-);`)
+	err = c.initialize(ctx)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("initialize cache: %w", err), c.Close())
 	}
@@ -166,7 +163,6 @@ func (c *Cache) State(ctx context.Context, key mail.MailboxKey) (mail.CacheState
 }
 
 type record struct {
-	header  []byte
 	summary mail.MessageSummary
 	headers map[string][]string
 }
@@ -186,8 +182,12 @@ func persistentFlags(flags []string) []string {
 	return result
 }
 
-func readRecords(ctx context.Context, tx *sql.Tx, key mail.MailboxKey) (map[uint32]record, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT uid, summary, headers FROM messages WHERE account=? AND mailbox=?`, key.Account, key.Name)
+func readRecords(ctx context.Context, tx *sql.Tx, key mail.MailboxKey, includeHeaders bool) (map[uint32]record, error) {
+	columns := "uid, summary"
+	if includeHeaders {
+		columns += ", headers"
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+columns+` FROM messages WHERE account=? AND mailbox=?`, key.Account, key.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -196,15 +196,21 @@ func readRecords(ctx context.Context, tx *sql.Tx, key mail.MailboxKey) (map[uint
 	for rows.Next() {
 		var uid uint32
 		var summary, headers []byte
-		if err := rows.Scan(&uid, &summary, &headers); err != nil {
+		dest := []any{&uid, &summary}
+		if includeHeaders {
+			dest = append(dest, &headers)
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		var item record
 		if err := json.Unmarshal(summary, &item.summary); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal(headers, &item.headers); err != nil {
-			return nil, err
+		if includeHeaders {
+			if err := json.Unmarshal(headers, &item.headers); err != nil {
+				return nil, err
+			}
 		}
 		records[uid] = item
 	}
@@ -214,6 +220,8 @@ func readRecords(ctx context.Context, tx *sql.Tx, key mail.MailboxKey) (map[uint
 // Apply commits a complete UID snapshot and its changes atomically. Membership
 // reconciliation deletes only SQLite rows; it performs no remote operations.
 func (c *Cache) Apply(ctx context.Context, key mail.MailboxKey, refresh mail.Refresh) error {
+	diagnostics.Stage(ctx, "Updating header cache")
+	defer diagnostics.Measure(ctx, "cache apply")()
 	key, err := canonicalKey(key)
 	if err != nil {
 		return err
@@ -268,7 +276,7 @@ func (c *Cache) Apply(ctx context.Context, key mail.MailboxKey, refresh mail.Ref
 	}
 	old := make(map[uint32]record)
 	if state.Present && state.UIDValidity == refresh.UIDValidity {
-		old, err = readRecords(ctx, tx, key)
+		old, err = readRecords(ctx, tx, key, false)
 		if err != nil {
 			return err
 		}
@@ -328,7 +336,7 @@ func (c *Cache) Apply(ctx context.Context, key mail.MailboxKey, refresh mail.Ref
 			var headers []byte
 			headers, err = json.Marshal(item.headers)
 			if err == nil {
-				_, err = tx.ExecContext(ctx, `INSERT INTO messages(account,mailbox,uid,header,summary,headers) VALUES(?,?,?,?,?,?) ON CONFLICT(account,mailbox,uid) DO UPDATE SET header=excluded.header, summary=excluded.summary, headers=excluded.headers`, key.Account, key.Name, uid, item.header, summary, headers)
+				_, err = tx.ExecContext(ctx, `INSERT INTO messages(account,mailbox,uid,summary,headers) VALUES(?,?,?,?,?) ON CONFLICT(account,mailbox,uid) DO UPDATE SET summary=excluded.summary, headers=excluded.headers`, key.Account, key.Name, uid, summary, headers)
 			}
 		}
 		if err != nil {

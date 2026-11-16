@@ -41,7 +41,6 @@ func parseMetadata(ref mail.MessageRef, metadata mail.Metadata) (record, error) 
 	}
 	h := message.Header{Header: header}
 	item := record{
-		header:  append([]byte{}, metadata.Header...),
 		headers: make(map[string][]string),
 		summary: summary,
 	}

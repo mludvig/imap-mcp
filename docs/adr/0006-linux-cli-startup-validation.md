@@ -8,6 +8,8 @@ The TLS-only policy is superseded by [ADR 0007](0007-imap-transport-modes.md);
 configuration discovery, diagnostics, startup-session closure, and readiness
 validation remain in force.
 
+[ADR 0009](0009-serialized-runtime-connection.md) replaces later per-operation runtime sessions with serialized reuse; the startup probe still closes before readiness. [ADR 0010](0010-process-diagnostics-and-progress.md) replaces the diagnostics privacy restriction with password-only redaction and adds persistent logs and progress.
+
 ## Context
 
 Requiring an absolute `--config` path adds setup friction, while serving MCP before checking IMAP can report readiness with an unusable TLS mode or account. Operators need startup progress without corrupting stdio JSON-RPC or disclosing credentials and mail.

@@ -3,10 +3,12 @@ package cache
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/mludvig/imap-mcp/internal/diagnostics"
 	"github.com/mludvig/imap-mcp/internal/mail"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -16,6 +18,8 @@ import (
 // substrings after NFC normalization and Unicode case folding, never SQL LIKE.
 // Only descending UID is pageable because the cursor is an exclusive upper UID.
 func (c *Cache) Query(ctx context.Context, key mail.MailboxKey, q mail.SearchQuery) (mail.MessagePage, error) {
+	diagnostics.Stage(ctx, "Searching header cache")
+	defer diagnostics.Measure(ctx, "cache query")()
 	for _, flags := range [][]string{q.Flags, q.NotFlags} {
 		for _, flag := range flags {
 			if strings.EqualFold(flag, "\\Recent") {
@@ -86,7 +90,17 @@ func (c *Cache) Query(ctx context.Context, key mail.MailboxKey, q mail.SearchQue
 	if err != nil {
 		return mail.MessagePage{}, err
 	}
-	records, err := readRecords(ctx, tx, key)
+	if pageable && unfiltered(q) {
+		page, err := listPage(ctx, tx, key, q, state.UIDValidity)
+		if err != nil {
+			return mail.MessagePage{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return mail.MessagePage{}, err
+		}
+		return page, nil
+	}
+	records, err := readRecords(ctx, tx, key, hasHeaderCriteria(q))
 	if err != nil {
 		return mail.MessagePage{}, err
 	}
@@ -150,6 +164,58 @@ func (c *Cache) Query(ctx context.Context, key mail.MailboxKey, q mail.SearchQue
 		}
 	}
 	return page, nil
+}
+
+func hasHeaderCriteria(q mail.SearchQuery) bool {
+	return q.From != "" || q.To != "" || q.Cc != "" || q.Bcc != "" || q.Subject != "" || len(q.Headers) != 0
+}
+
+func unfiltered(q mail.SearchQuery) bool {
+	return !hasHeaderCriteria(q) && q.MinSize == 0 && q.MaxSize == 0 &&
+		q.Since == "" && q.Before == "" && q.SentSince == "" && q.SentBefore == "" &&
+		len(q.Flags) == 0 && len(q.NotFlags) == 0
+}
+
+// Count and cursor rows share the epoch snapshot. The cursor never narrows total.
+// See docs/concepts/cache-coherence.md for pagination and summary invariants.
+func listPage(ctx context.Context, tx *sql.Tx, key mail.MailboxKey, q mail.SearchQuery, epoch uint32) (mail.MessagePage, error) {
+	page := mail.MessagePage{Messages: []mail.MessageSummary{}, UIDValidity: epoch}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE account=? AND mailbox=?`, key.Account, key.Name).Scan(&page.Total); err != nil {
+		return page, err
+	}
+	query := `SELECT summary FROM messages WHERE account=? AND mailbox=?`
+	args := []any{key.Account, key.Name}
+	if q.BeforeUID != 0 {
+		query += ` AND uid<?`
+		args = append(args, q.BeforeUID)
+	}
+	query += ` ORDER BY uid DESC LIMIT ?`
+	args = append(args, q.Limit+1)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return page, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var encoded []byte
+		if err := rows.Scan(&encoded); err != nil {
+			return page, err
+		}
+		if len(page.Messages) == q.Limit {
+			page.NextBeforeUID = page.Messages[len(page.Messages)-1].Ref.UID
+			break
+		}
+		var summary mail.MessageSummary
+		if err := json.Unmarshal(encoded, &summary); err != nil {
+			return page, err
+		}
+		summary.Flags = persistentFlags(summary.Flags)
+		page.Messages = append(page.Messages, summary)
+	}
+	if err := rows.Err(); err != nil {
+		return page, err
+	}
+	return page, rows.Close()
 }
 
 func folded(value string) string {

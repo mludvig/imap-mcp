@@ -50,7 +50,7 @@ func TestPersistentFlagsAndLegacyRecentCleanup(t *testing.T) {
 		t.Fatalf("legacy Get=%+v, %v", got, err)
 	}
 	if _, err := c.db.Exec(`
-CREATE TRIGGER immutable_headers BEFORE UPDATE OF header,headers ON messages
+CREATE TRIGGER immutable_headers BEFORE UPDATE OF headers ON messages
 BEGIN SELECT RAISE(ABORT, 'headers rewritten'); END;
 CREATE TRIGGER immutable_stable BEFORE UPDATE ON messages WHEN OLD.uid=2
 BEGIN SELECT RAISE(ABORT, 'unrelated summary rewritten'); END;`); err != nil {

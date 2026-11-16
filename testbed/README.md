@@ -37,3 +37,14 @@ never use CLOSE, EXPUNGE, or automatic cleanup that expunges existing messages.
 Cleanup is registered before container startup and removes only that container
 and its anonymous mail volume. Testing removes the fixture's temporary directory
 after container cleanup. No global Docker pruning or real account access occurs.
+
+Runtime lifecycle tests use `doveadm who -1` to verify one retained session and
+the same session across repeated reads and remote searches on rev1/rev2. Kicking
+only the fixture account forces stale-session recovery; shutdown must leave no
+session, and independent snapshots must preserve bytes, flags, dates, and UIDs.
+A localhost proxy with verified upstream TLS drops Dovecot's committed APPEND
+response: the client must report `outcome_unknown`, reconnect on a later call,
+and leave exactly one appended copy. CLI logs use test-owned XDG directories.
+The CLI diagnostics fixture checks token-scoped progress and JSON-RPC-only
+stdout alongside quiet/debug log levels, tool timings, underlying command
+errors, password redaction, and numeric local timestamp offsets.

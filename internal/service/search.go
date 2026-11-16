@@ -6,19 +6,44 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mludvig/imap-mcp/internal/diagnostics"
 	"github.com/mludvig/imap-mcp/internal/mail"
 )
 
+func (s *Service) logSearchError(ctx context.Context, stage, name string, err error) {
+	var typed *mail.Error
+	// Typed backend failures already have their underlying cause logged by the client.
+	if err == nil || errors.As(err, &typed) {
+		return
+	}
+	cfg := s.cfg.IMAP()
+	diagnostics.Logger(ctx).ErrorContext(ctx, "Mailbox search failed", "stage", stage, "host", cfg.Host(), "username", cfg.Username(), "mailbox", name, "error", err)
+}
+
 func (s *Service) refresh(ctx context.Context, key mail.MailboxKey) (uint32, error) {
+	defer diagnostics.Measure(ctx, "mailbox refresh")()
+	diagnostics.Stage(ctx, "Reading cached mailbox state")
+	done := diagnostics.Measure(ctx, "cache state")
 	state, err := s.store.State(ctx, key)
+	done()
 	if err != nil {
+		s.logSearchError(ctx, "cache state", key.Name, err)
 		return 0, safeError(err, "cache_error", false)
 	}
+	diagnostics.Stage(ctx, "Synchronizing mailbox headers; first synchronization may take longer")
+	done = diagnostics.Measure(ctx, "backend refresh")
 	updated, err := s.backend.Refresh(ctx, key.Name, state)
+	done()
 	if err != nil {
+		s.logSearchError(ctx, "backend refresh", key.Name, err)
 		return 0, safeError(err, "server_error", false)
 	}
-	if err := s.store.Apply(ctx, key, updated); err != nil {
+	diagnostics.Stage(ctx, "Applying refreshed mailbox headers")
+	done = diagnostics.Measure(ctx, "refresh cache apply")
+	err = s.store.Apply(ctx, key, updated)
+	done()
+	if err != nil {
+		s.logSearchError(ctx, "refresh cache apply", key.Name, err)
 		return 0, safeError(err, "cache_error", false)
 	}
 	return updated.UIDValidity, nil
@@ -29,7 +54,11 @@ func (s *Service) SearchMessages(ctx context.Context, input mail.SearchQuery) (m
 	if err != nil {
 		return mail.MessagePage{}, err
 	}
-	if err := s.lock(ctx); err != nil {
+	diagnostics.Stage(ctx, "Waiting for mailbox access")
+	done := diagnostics.Measure(ctx, "mailbox access wait")
+	err = s.lock(ctx)
+	done()
+	if err != nil {
 		return mail.MessagePage{}, err
 	}
 	defer s.unlock()
@@ -42,7 +71,11 @@ func (s *Service) SearchMessages(ctx context.Context, input mail.SearchQuery) (m
 			return mail.MessagePage{}, err
 		}
 		if !live {
+			diagnostics.Stage(ctx, "Searching local mailbox headers")
+			done := diagnostics.Measure(ctx, "local header query")
 			page, err := s.store.Query(ctx, key, q)
+			done()
+			s.logSearchError(ctx, "local header query", key.Name, err)
 			return page, safeError(err, "cache_error", false)
 		}
 		page, err := s.livePage(ctx, key, q, epoch)
@@ -65,8 +98,11 @@ func (s *Service) ListMessages(ctx context.Context, q mail.SearchQuery) (mail.Me
 }
 
 func (s *Service) sameEpoch(ctx context.Context, name string, epoch uint32) error {
+	diagnostics.Stage(ctx, "Checking mailbox UID epoch")
+	defer diagnostics.Measure(ctx, "mailbox epoch check")()
 	status, err := s.backend.MailboxStatus(ctx, name)
 	if err != nil {
+		s.logSearchError(ctx, "mailbox epoch check", name, err)
 		return safeError(err, "server_error", false)
 	}
 	if status.UIDValidity != epoch {
@@ -76,11 +112,16 @@ func (s *Service) sameEpoch(ctx context.Context, name string, epoch uint32) erro
 }
 
 func (s *Service) livePage(ctx context.Context, key mail.MailboxKey, q mail.SearchQuery, epoch uint32) (mail.MessagePage, error) {
+	defer diagnostics.Measure(ctx, "live search page")()
 	live := q
 	// The cursor is applied locally so Total counts all matches like Cache.Query.
 	live.BeforeUID = 0
+	diagnostics.Stage(ctx, "Searching the IMAP server")
+	done := diagnostics.Measure(ctx, "backend search")
 	uids, err := s.backend.SearchUIDs(ctx, live)
+	done()
 	if err != nil {
+		s.logSearchError(ctx, "backend search", key.Name, err)
 		return mail.MessagePage{}, safeError(err, "server_error", false)
 	}
 	seen := make(map[uint32]bool, len(uids))
@@ -115,8 +156,12 @@ func (s *Service) livePage(ctx context.Context, key mail.MailboxKey, q mail.Sear
 		}
 		selected = append(selected, uid)
 	}
+	diagnostics.Stage(ctx, "Reading matching cached message headers")
+	done = diagnostics.Measure(ctx, "cache result lookup")
 	page.Messages, err = s.store.Get(ctx, key, selected)
+	done()
 	if err != nil {
+		s.logSearchError(ctx, "cache result lookup", key.Name, err)
 		return mail.MessagePage{}, safeError(err, "cache_error", false)
 	}
 	for _, message := range page.Messages {

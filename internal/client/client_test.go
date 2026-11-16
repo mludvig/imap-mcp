@@ -167,6 +167,8 @@ func makePeerWithGreeting(t *testing.T, implicit bool, caps, greeting string, be
 						continue
 					}
 					switch p.command {
+					case "NOOP":
+						p.ok()
 					case "CAPABILITY":
 						p.send("* CAPABILITY %s\r\n", caps)
 						p.ok()
@@ -245,7 +247,7 @@ func hasCommand(commands []string, fragment string) bool {
 
 func TestVerifiedTLSRefusesUntrustedCertificate(t *testing.T) {
 	peer := makePeer(t, true, "IMAP4rev1", nil)
-	_, err := New(peer.config(t, true, false, "tls")).Info(context.Background())
+	_, err := newTestClient(t, peer.config(t, true, false, "tls")).Info(context.Background())
 	requireCode(t, err, "tls_failed")
 	commands, _ := peer.snapshot()
 	if hasCommand(commands, "LOGIN") || hasCommand(commands, "AUTHENTICATE") {
@@ -274,7 +276,7 @@ func TestRequiredSTARTTLSBeforeAuthentication(t *testing.T) {
 				p.writer = bufio.NewWriter(secure)
 				return true
 			})
-			_, err := New(peer.config(t, true, true, "starttls")).Info(context.Background())
+			_, err := newTestClient(t, peer.config(t, true, true, "starttls")).Info(context.Background())
 			if upgrade && err != nil {
 				t.Fatal(err)
 			}
@@ -294,7 +296,7 @@ func TestRequiredSTARTTLSBeforeAuthentication(t *testing.T) {
 func TestReadonlyAndNativeMoveGate(t *testing.T) {
 	peer := makePeer(t, true, "IMAP4rev1", nil)
 	refs := []mail.MessageRef{{Mailbox: "INBOX", UIDValidity: 7, UID: 5}}
-	read := New(peer.config(t, true, true, "tls"))
+	read := newTestClient(t, peer.config(t, true, true, "tls"))
 	calls := []func() error{
 		func() error {
 			_, err := read.AddFlags(context.Background(), mail.FlagRequest{Refs: refs, Flags: []string{"\\Seen"}})
@@ -325,7 +327,7 @@ func TestReadonlyAndNativeMoveGate(t *testing.T) {
 	if len(commands) != 0 || connections != 0 {
 		t.Fatal("readonly guard contacted the server")
 	}
-	_, err := New(peer.config(t, false, true, "tls")).MoveMessages(context.Background(), mail.TransferRequest{Refs: refs, Destination: "Trash"})
+	_, err := newTestClient(t, peer.config(t, false, true, "tls")).MoveMessages(context.Background(), mail.TransferRequest{Refs: refs, Destination: "Trash"})
 	requireCode(t, err, "unsupported")
 	commands, _ = peer.snapshot()
 	for _, command := range commands {
@@ -344,7 +346,7 @@ func TestStaleUIDValidityStopsBeforeFetch(t *testing.T) {
 		}
 		return false
 	})
-	_, err := New(peer.config(t, false, true, "tls")).ReadMessage(context.Background(), mail.ReadRequest{Ref: mail.MessageRef{Mailbox: "INBOX", UIDValidity: 7, UID: 5}})
+	_, err := newTestClient(t, peer.config(t, false, true, "tls")).ReadMessage(context.Background(), mail.ReadRequest{Ref: mail.MessageRef{Mailbox: "INBOX", UIDValidity: 7, UID: 5}})
 	requireCode(t, err, "stale_reference")
 	commands, _ := peer.snapshot()
 	if hasCommand(commands, "FETCH") {
@@ -380,7 +382,7 @@ func TestReadPEEKAcceptsUIDAfterLiteral(t *testing.T) {
 		}
 		return true
 	})
-	message, err := New(peer.config(t, false, true, "tls")).ReadMessage(context.Background(), mail.ReadRequest{Ref: mail.MessageRef{Mailbox: "INBOX", UIDValidity: 7, UID: 5}})
+	message, err := newTestClient(t, peer.config(t, false, true, "tls")).ReadMessage(context.Background(), mail.ReadRequest{Ref: mail.MessageRef{Mailbox: "INBOX", UIDValidity: 7, UID: 5}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +427,7 @@ func TestRecentDisappearsWithoutModseqChange(t *testing.T) {
 		}
 		return true
 	})
-	client := New(peer.config(t, true, true, "tls"))
+	client := newTestClient(t, peer.config(t, true, true, "tls"))
 	store, err := cache.Open(filepath.Join(t.TempDir(), "headers.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -472,7 +474,7 @@ func TestRecentDisappearsWithoutModseqChange(t *testing.T) {
 
 func TestRecentSearchRejectedBeforeNetwork(t *testing.T) {
 	peer := makePeer(t, true, "IMAP4rev1", nil)
-	client := New(peer.config(t, true, true, "tls"))
+	client := newTestClient(t, peer.config(t, true, true, "tls"))
 	for _, q := range []mail.SearchQuery{
 		{Flags: []string{"\\Recent"}},
 		{NotFlags: []string{"\\rEcEnT"}},
@@ -519,7 +521,7 @@ func TestLiteralCancellationAndOversizeCloseRawSocket(t *testing.T) {
 				}
 				return true
 			})
-			client := New(peer.config(t, true, true, "tls"))
+			client := newTestClient(t, peer.config(t, true, true, "tls"))
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			result := make(chan error, 1)
@@ -573,7 +575,8 @@ func TestUncertainWriteIsNotReplayed(t *testing.T) {
 		}
 		return true
 	})
-	_, err := New(peer.config(t, false, true, "tls")).AddFlags(context.Background(), mail.FlagRequest{Refs: []mail.MessageRef{{Mailbox: "INBOX", UIDValidity: 7, UID: 5}}, Flags: []string{"\\Seen"}})
+	client := newTestClient(t, peer.config(t, false, true, "tls"))
+	_, err := client.AddFlags(context.Background(), mail.FlagRequest{Refs: []mail.MessageRef{{Mailbox: "INBOX", UIDValidity: 7, UID: 5}}, Flags: []string{"\\Seen"}})
 	typed := requireCode(t, err, "server_error")
 	if !typed.OutcomeUnknown {
 		t.Fatal("uncertain write was reported as known failure")
@@ -590,6 +593,19 @@ func TestUncertainWriteIsNotReplayed(t *testing.T) {
 	}
 	if stores != 1 || connections != 1 {
 		t.Fatalf("write replayed: stores=%d connections=%d", stores, connections)
+	}
+	if _, err := client.Info(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	commands, connections = peer.snapshot()
+	stores = 0
+	for _, command := range commands {
+		if strings.Contains(command, "STORE") {
+			stores++
+		}
+	}
+	if stores != 1 || connections != 2 {
+		t.Fatalf("uncertain write replayed or failed transport reused: stores=%d connections=%d", stores, connections)
 	}
 }
 
@@ -646,7 +662,7 @@ func TestRefreshChangedFlagsExpungesAndHeaderFetchedOnce(t *testing.T) {
 		}
 		return true
 	})
-	client := New(peer.config(t, true, true, "tls"))
+	client := newTestClient(t, peer.config(t, true, true, "tls"))
 	first, err := client.Refresh(context.Background(), "INBOX", mail.CacheState{})
 	if err != nil {
 		t.Fatal(err)
@@ -685,7 +701,7 @@ func TestNOMODSEQUsesFullFlagsWithoutModseq(t *testing.T) {
 		}
 		return true
 	})
-	refreshed, err := New(peer.config(t, true, true, "tls")).Refresh(context.Background(), "INBOX", mail.CacheState{Present: true, UIDValidity: 7, HighestModSeq: 10, CachedUIDs: []uint32{5}})
+	refreshed, err := newTestClient(t, peer.config(t, true, true, "tls")).Refresh(context.Background(), "INBOX", mail.CacheState{Present: true, UIDValidity: 7, HighestModSeq: 10, CachedUIDs: []uint32{5}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,7 +735,7 @@ func TestESearchMaxUint32AndFullFilters(t *testing.T) {
 		return true
 	})
 	q := mail.SearchQuery{Mailbox: "INBOX", From: "alice", To: "bob", Cc: "carol", Bcc: "dan", Subject: "subject", Body: "body", Text: "text", Headers: map[string]string{"X-Tag": "tag"}, Since: "2026-01-01", Before: "2026-11-01", SentSince: "2026-02-01", SentBefore: "2026-10-01", Flags: []string{"\\Seen"}, NotFlags: []string{"\\Flagged"}, MinSize: 10, MaxSize: 100}
-	result, err := New(peer.config(t, true, true, "tls")).SearchUIDs(context.Background(), q)
+	result, err := newTestClient(t, peer.config(t, true, true, "tls")).SearchUIDs(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +774,7 @@ func TestNativeTransferMappingMaxUint32(t *testing.T) {
 				}
 				return true
 			})
-			client := New(peer.config(t, false, true, "tls"))
+			client := newTestClient(t, peer.config(t, false, true, "tls"))
 			request := mail.TransferRequest{Refs: []mail.MessageRef{{Mailbox: "INBOX", UIDValidity: 7, UID: ^uint32(0)}}, Destination: "Trash"}
 			var result mail.MutationResult
 			var err error
@@ -796,7 +812,7 @@ func TestFlagValidationAndRemoveDeleted(t *testing.T) {
 		}
 		return true
 	})
-	client := New(peer.config(t, false, true, "tls"))
+	client := newTestClient(t, peer.config(t, false, true, "tls"))
 	refs := []mail.MessageRef{{Mailbox: "INBOX", UIDValidity: 7, UID: 5}}
 	for _, flag := range []string{"\\Deleted", "\\dElEtEd", "\\Recent", "bad flag", "bad)flag", "bad\r\nflag"} {
 		_, err := client.AddFlags(context.Background(), mail.FlagRequest{Refs: refs, Flags: []string{flag}})
@@ -846,7 +862,7 @@ func TestAppendUIDAndUnknownOutcome(t *testing.T) {
 				}
 				return true
 			})
-			result, err := New(peer.config(t, false, true, "tls")).AppendMessage(context.Background(), mail.AppendRequest{Mailbox: "Drafts", MessageBase64: "U3ViamVjdDogdGVzdA0KDQpib2R5", Flags: []string{"\\Draft"}})
+			result, err := newTestClient(t, peer.config(t, false, true, "tls")).AppendMessage(context.Background(), mail.AppendRequest{Mailbox: "Drafts", MessageBase64: "U3ViamVjdDogdGVzdA0KDQpib2R5", Flags: []string{"\\Draft"}})
 			if drop {
 				typed := requireCode(t, err, "server_error")
 				if !typed.OutcomeUnknown {
@@ -889,7 +905,7 @@ func TestMessageSizeAndSequenceDriftFailSafely(t *testing.T) {
 				}
 				return true
 			})
-			_, err := New(peer.config(t, true, true, "tls")).ReadMessage(context.Background(), mail.ReadRequest{Ref: mail.MessageRef{Mailbox: "INBOX", UIDValidity: 7, UID: 5}})
+			_, err := newTestClient(t, peer.config(t, true, true, "tls")).ReadMessage(context.Background(), mail.ReadRequest{Ref: mail.MessageRef{Mailbox: "INBOX", UIDValidity: 7, UID: 5}})
 			if tooLarge {
 				requireCode(t, err, "too_large")
 			} else {
@@ -935,7 +951,7 @@ func TestCapabilityNegotiationListSortThread(t *testing.T) {
 		}
 		return true
 	})
-	client := New(peer.config(t, true, true, "tls"))
+	client := newTestClient(t, peer.config(t, true, true, "tls"))
 	info, err := client.Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -995,7 +1011,7 @@ func TestOperationDeadlineDuringCommand(t *testing.T) {
 		}
 		return true
 	})
-	client := New(peer.config(t, true, true, "tls"))
+	client := newTestClient(t, peer.config(t, true, true, "tls"))
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -1018,7 +1034,7 @@ func TestOperationDeadlineDuringCommand(t *testing.T) {
 
 func TestAdvertisedPLAINPreferredToLogin(t *testing.T) {
 	peer := makePeer(t, true, "IMAP4rev1 AUTH=PLAIN LOGINDISABLED", nil)
-	_, err := New(peer.config(t, true, true, "tls")).Info(context.Background())
+	_, err := newTestClient(t, peer.config(t, true, true, "tls")).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1068,7 +1084,7 @@ func TestRefreshReconcilesFinalMembershipAndEpoch(t *testing.T) {
 				}
 				return true
 			})
-			result, err := New(peer.config(t, true, true, "tls")).Refresh(context.Background(), "INBOX", mail.CacheState{})
+			result, err := newTestClient(t, peer.config(t, true, true, "tls")).Refresh(context.Background(), "INBOX", mail.CacheState{})
 			switch change {
 			case "expunge":
 				if err != nil {

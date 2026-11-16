@@ -25,7 +25,7 @@ type queryInput struct {
 	NotFlags   []string          `json:"not_flags,omitempty"`
 	MinSize    int64             `json:"min_size,omitempty"`
 	MaxSize    int64             `json:"max_size,omitempty"`
-	Limit      int               `json:"limit,omitempty" jsonschema:"Page size; defaults to 50, maximum 200."`
+	Limit      int               `json:"limit,omitempty" jsonschema:"Returned page size; defaults to 50, maximum 200. Does not bound header synchronization."`
 	BeforeUID  uint32            `json:"before_uid,omitempty" jsonschema:"Exclusive UID cursor; only with default UID descending sort."`
 	Sort       string            `json:"sort,omitempty" jsonschema:"Default UID descending; other sorts require server support."`
 }
@@ -51,7 +51,7 @@ type mailboxInput struct {
 
 type listInput struct {
 	Mailbox   string `json:"mailbox,omitempty" jsonschema:"Mailbox; defaults to INBOX."`
-	Limit     int    `json:"limit,omitempty" jsonschema:"Page size; defaults to 50, maximum 200."`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Returned page size; defaults to 50, maximum 200. Does not bound header synchronization."`
 	BeforeUID uint32 `json:"before_uid,omitempty" jsonschema:"Exclusive UID cursor; only with default UID descending sort."`
 	Sort      string `json:"sort,omitempty" jsonschema:"Default UID descending; other sorts require server support."`
 }

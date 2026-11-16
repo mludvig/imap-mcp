@@ -152,6 +152,7 @@ type mcpProcess struct {
 func startMCP(t *testing.T, binary, configFile string) *mcpProcess {
 	t.Helper()
 	p := &mcpProcess{cmd: exec.Command(binary, "--config", configFile)}
+	p.cmd.Env = append(os.Environ(), "XDG_CACHE_HOME="+t.TempDir())
 	cfg, err := config.Load(configFile)
 	if err != nil {
 		t.Fatal(err)

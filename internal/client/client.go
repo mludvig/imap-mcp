@@ -6,21 +6,45 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"log/slog"
 	"net"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-sasl"
 	"github.com/mludvig/imap-mcp/internal/config"
+	"github.com/mludvig/imap-mcp/internal/diagnostics"
 	"github.com/mludvig/imap-mcp/internal/mail"
 )
 
-type Client struct{ cfg *config.Config }
+// Runtime ownership and idle expiry: see docs/adr/0009-serialized-runtime-connection.md.
+const connectionIdleTimeout = 10 * time.Minute
 
-func New(cfg *config.Config) *Client { return &Client{cfg: cfg} }
+type Client struct {
+	cfg          *config.Config
+	gate         chan struct{}
+	done         chan struct{}
+	logCtx       context.Context
+	logCancel    context.CancelFunc
+	mu           sync.Mutex
+	runtime      *session
+	active       bool
+	activeCancel context.CancelFunc
+	closed       bool
+	closeErr     error
+	idleTimer    *time.Timer
+	idleEpoch    uint64
+	idleTimeout  time.Duration
+}
+
+func New(cfg *config.Config) *Client {
+	logCtx, logCancel := context.WithCancel(context.Background())
+	return &Client{cfg: cfg, gate: make(chan struct{}, 1), done: make(chan struct{}), logCtx: logCtx, logCancel: logCancel, idleTimeout: connectionIdleTimeout}
+}
 
 var _ mail.Backend = (*Client)(nil)
 
@@ -28,22 +52,29 @@ var _ mail.Backend = (*Client)(nil)
 // A non-nil callback receives "tls", "starttls", or "none" once before authentication.
 // The startup diagnostic boundary is described in docs/adr/0006-linux-cli-startup-validation.md.
 func (c *Client) CheckConnection(ctx context.Context, reportTransport func(string)) error {
-	s, err := c.openWithTransport(ctx, reportTransport)
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.IMAP().OperationTimeout())
+	defer cancel()
+	s, err := c.dial(ctx, reportTransport, false)
 	if err != nil {
 		return err
 	}
-	s.close()
+	s.teardown()
 	return nil
 }
 
-// Each operation owns a connection. Cancellation closes the raw socket, even
-// during TLS/literal I/O; see docs/concepts/imap-safety.md.
+// Operations own leases; cancellation must finish before a transport is reused.
+// See docs/concepts/imap-safety.md.
 type session struct {
 	c        *imapclient.Client
 	raw      net.Conn
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stop     func() bool
+	stopped  chan struct{}
+	conn     *deadlineConn
+	owner    *Client
+	logger   *slog.Logger
+	invalid  bool
 	caps     imap.CapSet
 	enabled  imap.CapSet
 	noModSeq bool
@@ -51,23 +82,37 @@ type session struct {
 
 type deadlineConn struct {
 	net.Conn
+	mu       sync.Mutex
 	deadline time.Time
 }
 
 func (c *deadlineConn) clamp(t time.Time) time.Time {
-	if t.IsZero() || c.deadline.Before(t) {
+	if !c.deadline.IsZero() && (t.IsZero() || c.deadline.Before(t)) {
 		return c.deadline
 	}
 	return t
 }
-func (c *deadlineConn) SetDeadline(t time.Time) error     { return c.Conn.SetDeadline(c.clamp(t)) }
-func (c *deadlineConn) SetReadDeadline(t time.Time) error { return c.Conn.SetReadDeadline(c.clamp(t)) }
+func (c *deadlineConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.SetDeadline(c.clamp(t))
+}
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.SetReadDeadline(c.clamp(t))
+}
 func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.Conn.SetWriteDeadline(c.clamp(t))
 }
 
-func (c *Client) open(ctx context.Context) (*session, error) {
-	return c.openWithTransport(ctx, nil)
+func (c *deadlineConn) operationDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadline = t
+	return c.Conn.SetDeadline(t)
 }
 
 func initialTransport(mode string, port int) string {
@@ -78,20 +123,35 @@ func initialTransport(mode string, port int) string {
 	return mode
 }
 
-func (c *Client) openWithTransport(ctx context.Context, reportTransport func(string)) (*session, error) {
+func (c *Client) dial(ctx context.Context, reportTransport func(string), runtime bool) (*session, error) {
 	cfg := c.cfg.IMAP()
-	ctx, cancel := context.WithTimeout(ctx, cfg.OperationTimeout())
+	diagnostics.Stage(ctx, "Connecting to IMAP server")
+	defer diagnostics.Measure(ctx, "IMAP connection setup")()
+	logger := diagnostics.Logger(ctx)
+	logger.InfoContext(ctx, "IMAP connection setup", "host", cfg.Host(), "port", cfg.Port(), "username", cfg.Username())
+	logFailure := func(stage string, err error) {
+		logger.ErrorContext(ctx, "IMAP connection failed", "stage", stage, "host", cfg.Host(), "port", cfg.Port(), "username", cfg.Username(), "error", err)
+	}
 	raw, err := (&net.Dialer{Timeout: cfg.ConnectTimeout()}).DialContext(ctx, "tcp", net.JoinHostPort(cfg.Host(), strconv.Itoa(cfg.Port())))
 	if err != nil {
+		logFailure("tcp dial", err)
 		failure := safeError(ctx, err, "connection_failed", false)
-		cancel()
 		return nil, failure
 	}
-	s := &session{raw: raw, ctx: ctx, cancel: cancel, enabled: make(imap.CapSet)}
-	s.stop = context.AfterFunc(ctx, func() { _ = raw.Close() })
-	deadline, _ := ctx.Deadline()
-	conn := &deadlineConn{Conn: raw, deadline: deadline}
-	_ = conn.SetDeadline(deadline)
+	s := &session{raw: raw, enabled: make(imap.CapSet), logger: logger, conn: &deadlineConn{Conn: raw}}
+	if runtime {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			_ = raw.Close()
+			return nil, clientClosedError()
+		}
+		s.owner = c
+		c.runtime = s
+		c.mu.Unlock()
+	}
+	s.attach(ctx)
+	conn := s.conn
 	opts := &imapclient.Options{TLSConfig: cfg.TLSConfig()}
 	mode := initialTransport(cfg.TLS(), cfg.Port())
 	switch mode {
@@ -107,38 +167,41 @@ func (c *Client) openWithTransport(ctx context.Context, reportTransport func(str
 		s.c = imapclient.New(conn, opts)
 	}
 	if err != nil {
+		logFailure("transport setup", err)
 		failure := safeError(ctx, err, "tls_failed", false)
-		s.close()
+		s.teardown()
 		return nil, failure
 	}
 	if err = s.c.WaitGreeting(); err != nil {
+		logFailure("greeting", err)
 		failure := safeError(ctx, err, "connection_failed", false)
-		s.close()
+		s.teardown()
 		return nil, failure
 	}
 	caps := s.c.Caps()
 	if caps == nil {
 		failure := s.err(errors.New("IMAP capability discovery failed"), false)
-		s.close()
+		s.teardown()
 		return nil, failure
 	}
 	if mode == "auto" {
 		mode = "none"
 		if caps.Has(imap.CapStartTLS) {
 			if s.c.State() != imap.ConnStateNotAuthenticated {
-				s.close()
+				s.teardown()
 				return nil, mail.NewError("tls_failed", "Cannot establish verified TLS with the IMAP server")
 			}
 			if err = s.c.StartTLS(cfg.TLSConfig()); err != nil {
+				logFailure("starttls", err)
 				failure := safeError(ctx, err, "tls_failed", false)
-				s.close()
+				s.teardown()
 				return nil, failure
 			}
 			mode = "starttls"
 			caps = s.c.Caps()
 			if caps == nil {
 				failure := s.err(errors.New("IMAP capability discovery failed"), false)
-				s.close()
+				s.teardown()
 				return nil, failure
 			}
 		}
@@ -146,7 +209,10 @@ func (c *Client) openWithTransport(ctx context.Context, reportTransport func(str
 	if reportTransport != nil {
 		reportTransport(mode)
 	}
+	logger.InfoContext(ctx, "IMAP transport established", "transport", mode, "host", cfg.Host())
 	if s.c.State() == imap.ConnStateNotAuthenticated {
+		diagnostics.Stage(ctx, "Authenticating to IMAP server")
+		finishAuth := diagnostics.Measure(ctx, "IMAP authentication")
 		if caps.Has(imap.AuthCap("PLAIN")) {
 			err = s.c.Authenticate(sasl.NewPlainClient("", cfg.Username(), cfg.Password()))
 		} else if !caps.Has(imap.CapLoginDisabled) {
@@ -154,24 +220,27 @@ func (c *Client) openWithTransport(ctx context.Context, reportTransport func(str
 		} else {
 			err = errors.New("no permitted authentication mechanism")
 		}
+		finishAuth()
 		if err != nil {
+			logFailure("authentication", err)
 			failure := safeError(ctx, err, "authentication_failed", false)
-			s.close()
+			s.teardown()
 			return nil, failure
 		}
 	}
+	logger.InfoContext(ctx, "IMAP authenticated", "username", cfg.Username(), "host", cfg.Host())
 	// Authentication can change the advertised capability set.
 	s.caps, err = s.c.Capability().Wait()
 	if err != nil {
 		failure := s.err(err, false)
-		s.close()
+		s.teardown()
 		return nil, failure
 	}
 	// beta.9 signals LOGIN completion before updating State. The capability
 	// round trip also orders this state check after that update.
 	// See docs/concepts/imap-safety.md.
 	if s.c.State() != imap.ConnStateAuthenticated {
-		s.close()
+		s.teardown()
 		return nil, mail.NewError("authentication_failed", "IMAP authentication failed")
 	}
 	if s.caps.Has(imap.CapEnable) {
@@ -185,7 +254,7 @@ func (c *Client) openWithTransport(ctx context.Context, reportTransport func(str
 			enabled, enableErr := s.c.Enable(capability).Wait()
 			if enableErr != nil {
 				failure := s.err(enableErr, false)
-				s.close()
+				s.teardown()
 				return nil, failure
 			}
 			s.enabled = enabled.Caps
@@ -194,19 +263,14 @@ func (c *Client) openWithTransport(ctx context.Context, reportTransport func(str
 	return s, nil
 }
 
-func (s *session) close() {
+func (s *session) teardown() {
 	if s.raw != nil {
 		_ = s.raw.Close()
 	}
 	if s.c != nil {
 		_ = s.c.Close()
 	}
-	if s.stop != nil {
-		s.stop()
-	}
-	if s.cancel != nil {
-		s.cancel()
-	}
+	s.stopCancellation()
 }
 
 func safeError(ctx context.Context, err error, fallback string, write bool) error {
@@ -251,6 +315,10 @@ func safeError(ctx context.Context, err error, fallback string, write bool) erro
 	return &mail.Error{Code: code, Message: msg, OutcomeUnknown: write && !knownFailure}
 }
 func (s *session) err(err error, write bool) error {
+	if err != nil {
+		s.invalid = true
+		diagnostics.Logger(s.ctx).WarnContext(s.ctx, "IMAP command failed", "error", err, "write", write)
+	}
 	return safeError(s.ctx, err, "server_error", write)
 }
 
@@ -352,6 +420,8 @@ func (s *session) selectMailbox(name string, readonly bool) (*imap.SelectData, e
 	if name == "" {
 		return nil, mail.NewError("invalid_argument", "Mailbox is required")
 	}
+	s.noModSeq = false
+	diagnostics.Logger(s.ctx).DebugContext(s.ctx, "IMAP mailbox selection", "mailbox", name, "readonly", readonly)
 	data, err := s.c.Select(name, &imap.SelectOptions{ReadOnly: readonly, CondStore: s.caps.Has(imap.CapCondStore)}).Wait()
 	if err != nil {
 		return nil, s.err(err, false)

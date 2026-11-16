@@ -18,9 +18,14 @@ password = "replace-me"
 tls = "auto"
 connect_timeout_seconds = 10
 operation_timeout_seconds = 60
+# Runtime calls share one connection; gate waiting counts toward this timeout.
+# An idle connection closes after ten minutes; startup uses a separate probe.
 # ca_file = "private-ca.pem"
 
 [cache]
 # Empty uses the OS user cache directory: imap-mcp/headers.sqlite3.
 # Relative paths resolve beside this configuration file.
+# Known old raw-header caches rebuild once; the next query refetches headers.
+# Logs always use os.UserCacheDir()/imap-mcp/imap-mcp.log, independent of path.
+# Only the password is redacted; --quiet still writes logs, --debug adds detail.
 path = ""

@@ -57,7 +57,7 @@ func TestTransportResolvedBeforeAuthentication(t *testing.T) {
 				return true
 			})
 			var reported []string
-			err := New(peer.config(t, true, true, test.mode)).CheckConnection(context.Background(), func(mode string) {
+			err := newTestClient(t, peer.config(t, true, true, test.mode)).CheckConnection(context.Background(), func(mode string) {
 				reported = append(reported, mode)
 				commands, _ := peer.snapshot()
 				if hasCommand(commands, "LOGIN") || hasCommand(commands, "AUTHENTICATE") {
@@ -123,7 +123,7 @@ func TestAutoSTARTTLSUsesFreshCapabilitiesBeforeAuthentication(t *testing.T) {
 				return true
 			})
 			var reported []string
-			err := New(peer.config(t, true, true, "auto")).CheckConnection(context.Background(), func(mode string) {
+			err := newTestClient(t, peer.config(t, true, true, "auto")).CheckConnection(context.Background(), func(mode string) {
 				reported = append(reported, mode)
 				commands, _ := peer.snapshot()
 				if hasCommand(commands, "LOGIN") || hasCommand(commands, "AUTHENTICATE") {
@@ -188,7 +188,7 @@ func TestCapabilityDiscoveryFailureDoesNotAuthenticateOrChoosePlaintext(t *testi
 				return true
 			})
 			var reported []string
-			err := New(peer.config(t, true, true, test.mode)).CheckConnection(context.Background(), func(mode string) {
+			err := newTestClient(t, peer.config(t, true, true, test.mode)).CheckConnection(context.Background(), func(mode string) {
 				reported = append(reported, mode)
 			})
 			requireCode(t, err, "server_error")
@@ -220,7 +220,7 @@ func TestAutoAdvertisedSTARTTLSFailureDoesNotRetry(t *testing.T) {
 				return true
 			})
 			var reported []string
-			err := New(peer.config(t, true, trust, "auto")).CheckConnection(context.Background(), func(mode string) {
+			err := newTestClient(t, peer.config(t, true, trust, "auto")).CheckConnection(context.Background(), func(mode string) {
 				reported = append(reported, mode)
 			})
 			typed := requireCode(t, err, "tls_failed")
@@ -263,7 +263,7 @@ func TestAutoCancellationAndDeadlineCloseDiscoveryAndUpgrade(t *testing.T) {
 				}
 				defer cancel()
 				result := make(chan error, 1)
-				client := New(peer.config(t, true, true, "auto"))
+				client := newTestClient(t, peer.config(t, true, true, "auto"))
 				go func() {
 					result <- client.CheckConnection(ctx, func(mode string) {
 						t.Errorf("stalled transport reported as %q", mode)
@@ -316,7 +316,7 @@ func TestTransportPREAUTHMatrix(t *testing.T) {
 				return true
 			})
 			var reported []string
-			err := New(peer.config(t, true, true, test.mode)).CheckConnection(context.Background(), func(mode string) {
+			err := newTestClient(t, peer.config(t, true, true, test.mode)).CheckConnection(context.Background(), func(mode string) {
 				reported = append(reported, mode)
 			})
 			if test.reject {

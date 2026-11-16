@@ -21,7 +21,7 @@ func TestGetPreservesLiveUIDOrderAndStoredSummaries(t *testing.T) {
 	// Broken header indexes and unrelated summaries must not affect page lookup.
 	if _, err := c.db.Exec(`UPDATE messages SET headers='invalid JSON';
 UPDATE messages SET summary='invalid JSON' WHERE uid=4;
-CREATE TRIGGER immutable_header BEFORE UPDATE OF header ON messages BEGIN SELECT RAISE(ABORT, 'header rewritten'); END`); err != nil {
+CREATE TRIGGER immutable_header BEFORE UPDATE OF headers ON messages BEGIN SELECT RAISE(ABORT, 'headers rewritten'); END`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := c.Get(testContext, key, []uint32{2, 1, 3})

@@ -86,26 +86,48 @@ full usage and options without loading configuration or connecting.
 
 | Verbosity | Diagnostics on stderr |
 | --- | --- |
-| Default | Resolved config/cache paths, readonly mode, actual IMAP transport, connection-check progress, readiness |
+| Default | Resolved config/cache/log paths, readonly mode, actual IMAP transport, connection-check progress, readiness |
 | `--quiet` | Errors only |
 | `--verbose` | Default output plus lifecycle detail |
-| `--debug` | Verbose output plus fixed startup stages and timings |
+| `--debug` | Verbose output plus startup and tool stages and timings |
 
 The enabled `--quiet`, `--verbose`, and `--debug` modes are pairwise mutually
-exclusive. Debug output includes no raw IMAP traffic, credentials, or message
-contents.
+exclusive. Standard output remains MCP JSON-RPC only.
+
+Persistent JSON logs use `os.UserCacheDir()/imap-mcp/imap-mcp.log`, independent
+of `cache.path`. On Linux this is `$XDG_CACHE_HOME/imap-mcp/imap-mcp.log`, or
+`$HOME/.cache/imap-mcp/imap-mcp.log` when XDG_CACHE_HOME is unset. The directory
+is 0700 and files are 0600; retention is at most 50 MiB: 10 MiB active plus
+four backups (`imap-mcp.log.1` through `.4`). Timestamps use local RFC3339 time
+with a numeric offset, including `+00:00` in UTC. Processes sharing the log
+directory serialize appends and rotation through the stable, empty
+`imap-mcp.log.lock`; the bounds require cooperating writers and filesystem
+flock support. Never delete the lock file while a writer can run.
+
+Normal logs include lifecycle events, errors, and tool completion timings even
+with `--quiet`. `--debug` adds connection, synchronization, cache, and query
+stages/timings plus tool inputs and bounded results. Only the configured
+password is redacted; usernames, mailbox names, paths, queries, and message
+data may be logged. No raw IMAP protocol dump is produced.
 
 Startup loads the configuration, opens the cache, and establishes the configured
 IMAP transport. Diagnostics report actual implicit TLS, STARTTLS, or plaintext
 transport before client authentication. The check validates an authenticated
 session within `connect_timeout_seconds` and `operation_timeout_seconds`, closes
-it, and only then reports MCP readiness; later tool calls open their own sessions.
+it, and only then reports MCP readiness. Runtime backend operations share one
+authenticated connection and run serially; their timeout includes waiting for
+that connection. A reused session gets a bounded NOOP health check; failure
+permits one fresh connection before the operation starts, with no command or
+write replay. Operations using message references still select their mailbox
+and check UIDVALIDITY.
+Ten minutes without an active operation closes the runtime connection, and
+shutdown interrupts active or idle I/O.
 A failed check exits with status 1 instead of advertising offline readiness.
 
 | Exit status | Meaning |
 | --- | --- |
 | 0 | Help, normal stdio EOF, or SIGINT/SIGTERM shutdown |
-| 1 | Configuration, cache, startup connection check, or stdio server failure |
+| 1 | Configuration, cache, log, startup connection check, stdio server, or resource-close failure |
 | 2 | Invalid arguments, including conflicting verbosity modes |
 
 Configuration is loaded once.
@@ -200,6 +222,12 @@ Search accepts `mailbox`, `from`, `to`, `cc`, `bcc`, `subject`, `body`, `text`,
 {"headers":{"X-Project":"Orion"},"not_flags":["\\Seen"],"limit":50}
 ```
 
+Use separate queries for topic or sender alternatives. After folder creation or
+mail import, refresh `list_mailboxes` before claiming coverage. Keep criteria
+unchanged while paging; broaden FROM for forwarded or quoted correspondence,
+read candidate replies separately from quoted questions, and state the scope
+of negative findings.
+
 A successful tool's `structuredContent` is `{"data":...}`; the same JSON appears
 in its text fallback. A search/list page contains `messages`, `uid_validity`,
 `total`, and an optional `next_before_uid`. Each summary includes a complete
@@ -258,10 +286,16 @@ APPEND stores an RFC 5322 message in IMAP and does not send it through SMTP.
 
 ## Search and cache behavior
 
-SQLite persists raw headers, decoded header metadata, flags, membership, and
-mailbox epochs. It stores no bodies or attachments. Files are private (0600),
+SQLite persists summaries, all decoded header fields (including repeated and
+empty values), flags, membership, and mailbox epochs. It stores no raw headers,
+bodies, or attachments. Files are private (0600),
 new directories use 0700, and the cache is **unencrypted**: headers can contain
 sensitive information. Existing parent directory permissions are retained.
+
+The exact old raw-header cache schema rebuilds automatically under the exclusive
+lock: all rows and checkpoints are discarded and SQLite compacts the file.
+The next request refetches headers. Current caches reopen without rebuilding;
+unknown, customized, foreign, or future schemas fail without replacement.
 
 Every list/search first refreshes against the live IMAP server. The first sync
 is O(N) in mailbox membership and headers. Later searches fetch new headers and
@@ -270,6 +304,15 @@ without CONDSTORE or with NOMODSEQ they fetch all flags. A failed refresh return
 an error, never an offline or stale answer. Writes durably invalidate affected
 mailboxes before dispatch. Account partitions use host, port, TLS mode, and
 username; changing only a password preserves the partition.
+
+`limit` bounds the returned page, not header synchronization. Unfiltered
+descending-UID listings count matches and fetch a bounded SQL page in one
+snapshot; non-header queries avoid loading decoded header maps.
+
+Calls that supply an MCP progress token receive synchronization, fetch, cache,
+and query stage messages with increasing counts and no total. These counts are
+not percentages, and display depends on the client. Calls without a token can
+use `--debug` stages in stderr and the log.
 
 Header matching is a literal substring after Unicode NFC normalization and case
 folding. Flags and keywords compare without case sensitivity. Session-specific
@@ -396,6 +439,9 @@ If using Go from PATH, substitute `go` for `../../.tools/go/bin/go`.
 It exercises the real CLI over SDK MCP stdio, IMAP4rev1/rev2, implicit TLS and
 STARTTLS, Unicode headers/mailboxes, MIME attachments, pagination, flag/date/byte
 preservation, startup tool inventories, mutations, and persistent refresh.
+Runtime lifecycle checks verify session reuse, forced-disconnect recovery,
+shutdown release, and Seen preservation; a dropped committed APPEND response
+verifies `outcome_unknown` and exactly one stored copy after a later reconnect.
 Each fixture uses synthetic mail and credentials, random ports bound to
 127.0.0.1, an owned container/volume, and registered cleanup. See the
 [reproducible testbed](testbed/README.md) for setup and fixture details.
@@ -422,13 +468,23 @@ checks, plus the complete Dovecot integration suite, on 2026-11-17. An actual
 `make clean` followed by plain `make` removed and rebuilt the compilation
 artifacts while preserving source, the toolchain, and dependency downloads.
 
+The connection/cache/diagnostics changes passed build, root and local-module
+unit, race, and vet checks, plus the complete Dovecot suite, on 2026-11-17 with
+Go 1.25.14. Progress routing is tested through SDK in-memory transports and the
+real CLI stdout boundary together with quiet/debug file logging; display in
+host clients and live-mailbox speedups remain unmeasured.
+
 The [architecture decisions](docs/adr/0001-go-stdio-startup-policy.md),
 [Linux CLI startup decision](docs/adr/0006-linux-cli-startup-validation.md),
 [IMAP transport modes](docs/adr/0007-imap-transport-modes.md),
+[decoded-header cache](docs/adr/0008-decoded-header-cache.md),
+[runtime connection ownership](docs/adr/0009-serialized-runtime-connection.md),
+[diagnostics and progress](docs/adr/0010-process-diagnostics-and-progress.md),
 [cache coherence](docs/concepts/cache-coherence.md),
 [message identity](docs/concepts/message-identity.md),
 [IMAP safety](docs/concepts/imap-safety.md), and
 [stdio contract](docs/concepts/stdio-mcp.md) describe the load-bearing invariants.
 
-See [mail-search lessons](docs/notes/mail-search-lessons.md) for observations and
-proposed improvements from actual stdio and native Codex/MCP searches.
+See [mail-search lessons](docs/notes/mail-search-lessons.md) for historical
+observations, implemented improvements, and remaining proposals from actual
+stdio and native Codex/MCP searches.

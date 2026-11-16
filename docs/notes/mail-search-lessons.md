@@ -1,7 +1,8 @@
 # Mail-search lessons
 
 2026-11-17. Findings from reported stdio and native Codex/MCP searches and a
-source review. Improvements below are proposals; no runtime behavior changed.
+source review. Timing observations below precede the implemented improvements;
+they are not measurements of the new connection or cache behavior.
 
 ## Observed search coverage
 
@@ -36,39 +37,48 @@ a controlled benchmark. Native timings measure tool callbacks, excluding model
 reasoning and startup. Cached searches still refresh live state and fail if
 refresh fails.
 
-## Highest-priority TODO: connection reuse
+## Implemented: connection reuse
 
-Keep one authenticated runtime connection; close it after about ten minutes
-without an active operation, as requested. No pool or background IDLE is needed.
-Today backend operations open/close their sessions. Source-derived counts
-without retries are one session for locally evaluated header search with
-default/local sort, and four for BODY/TEXT or header-only search sorted by To/Cc:
-refresh, remote search, and two epoch checks. STATUS inside refresh uses its
-existing session. Reuse removes setup; UID reconciliation and cache work remain.
+Backend operations now share one authenticated runtime connection, serialize
+through a cancellable gate, and close it after ten minutes without an active
+operation. Previously, source-derived counts without retries were one session
+for local header search with default/local sort and four for BODY/TEXT or
+header-only search sorted by To/Cc: refresh, remote search, and two epoch checks.
+Reuse removes repeated setup; UID reconciliation and cache work remain.
 
-Serialize every backend operation; reset deadlines and operation/selection-local
-NOMODSEQ state for each use. Cancellation must invalidate the connection;
-old cancellation callbacks or idle timers must never close a later operation's
-connection. Idle expiry applies only while no operation owns it. Close active
-or idle connections on shutdown, detect stale connections before reuse, and
-bound any read-only recovery. Preserve per-operation mailbox selection, epoch
-guards, and fresh capability negotiation after reconnect. Never replay writes;
-preserve `outcome_unknown`. The separate startup authentication check still
-disconnects before readiness.
+Operation deadlines are renewed and cleared, NOMODSEQ resets per selection,
+and release finishes cancellation callbacks before reuse; idle generations
+reject obsolete timers. A bounded pre-operation NOOP permits one reconnect
+before commands begin, with fresh capabilities; operation errors discard the
+connection without replay. Mailbox selection, epoch guards, `outcome_unknown`,
+shutdown interruption, and the separately closed startup probe remain.
 
-Future checks: repeated/concurrent calls and idle expiry; cancellation/deadline/
-shutdown ownership; remote disconnects with bounded read-only recovery and no
-write replay. Measure setup, refresh, and cache costs separately. Implementation
-would need a new ADR superseding
-[ADR 0003](../adr/0003-safe-imap-operations.md)'s connection-ownership decision.
+Lifecycle regressions cover reuse, concurrent calls, idle expiry, obsolete
+timers, deadlines, cancellation, shutdown, selection state, failed health
+checks, and no write replay. See
+[ADR 0009](../adr/0009-serialized-runtime-connection.md) for the superseding
+ownership decision.
 
-## Small guidance improvements
+## Implemented: cache, diagnostics, and guidance
+
+SQLite now stores summaries and all decoded headers without raw copies,
+rebuilds the exact legacy schema with compaction, avoids header-map loading for
+non-header work, and uses bounded SQL pages for unfiltered descending-UID lists.
+See [ADR 0008](../adr/0008-decoded-header-cache.md). These changes do not remove
+live synchronization or establish a speedup for the reported mailbox.
+
+Persistent bounded logs record normal lifecycle/tool timings; `--debug` adds
+setup, synchronization, cache, and query detail with password-only redaction.
+Token-bearing MCP calls receive increasing stage counts without a total; client
+display remains client-dependent. See
+[ADR 0010](../adr/0010-process-diagnostics-and-progress.md).
 
 Search criteria combine with AND; use separate queries for alternatives because
-there is no general OR input. Add AND semantics, literal local substrings, and
-first-sync cost to `search_messages` metadata, as already documented in README.
-Explain that `limit` bounds results, not synchronization, and BODY/TEXT matching
-is server-defined. Consider first-sync progress feedback; no timeout occurred.
+there is no general OR input. Tool metadata now explains AND semantics, literal
+local substrings, first-sync cost, and that `limit` bounds results rather than
+synchronization; BODY/TEXT matching remains server-defined. Guidance also covers
+fresh mailbox discovery, unchanged paging criteria, broadened sender coverage,
+reply attribution, and scoped negative findings.
 
 1. Refresh accessible mailboxes and establish sender-only coverage.
 2. Page summaries with unchanged criteria and the returned cursor.
@@ -77,6 +87,14 @@ is server-defined. Consider first-sync progress feedback; no timeout occurred.
 4. Read candidates using returned references and attribute the author's own
    reply separately from quoted questions. Report negatives with their scope.
 
+## Remaining proposals
+
+Repeat representative cold and warm searches with controlled queries, separating
+setup, refresh, and cache costs using the new timings. Verify progress display
+in token-capable host clients; in-memory and real CLI protocol tests do not
+verify their UI.
+No live mailbox timing or host-display result is claimed for these changes.
+
 Source checks: [tool descriptions](../../internal/server/server.go),
-[search flow](../../internal/service/search.go), [sessions](../../internal/client/client.go),
+[search flow](../../internal/service/search.go), [sessions](../../internal/client/lifecycle.go),
 [refresh](../../internal/client/fetch.go), [inputs](../../internal/server/inputs.go).
