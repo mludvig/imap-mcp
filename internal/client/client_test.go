@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mludvig/imap-mcp/internal/cache"
 	"github.com/mludvig/imap-mcp/internal/config"
 	"github.com/mludvig/imap-mcp/internal/mail"
 )
@@ -344,7 +345,7 @@ func TestReadPEEKAcceptsUIDAfterLiteral(t *testing.T) {
 			p.selectBox(7, 1, 0)
 		case "UID":
 			if strings.HasPrefix(p.args, "FETCH") {
-				p.send("* 1 FETCH (UID 5 FLAGS (\\Flagged) INTERNALDATE \"16-Nov-2026 12:00:00 +0000\" RFC822.SIZE %d)\r\n", len(raw))
+				p.send("* 1 FETCH (UID 5 FLAGS (\\Flagged \\rEcEnT) INTERNALDATE \"16-Nov-2026 12:00:00 +0000\" RFC822.SIZE %d)\r\n", len(raw))
 				p.ok()
 			} else {
 				return false
@@ -365,7 +366,7 @@ func TestReadPEEKAcceptsUIDAfterLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message.Text != "hello" || message.Summary.Subject != "Test" {
+	if message.Text != "hello" || message.Summary.Subject != "Test" || len(message.Summary.Flags) != 1 || message.Summary.Flags[0] != "\\Flagged" {
 		t.Fatalf("unexpected decoded message: %#v", message)
 	}
 	commands, _ := peer.snapshot()
@@ -374,6 +375,103 @@ func TestReadPEEKAcceptsUIDAfterLiteral(t *testing.T) {
 	}
 	if hasCommand(commands, "STORE") || hasCommand(commands, "\\Seen") {
 		t.Fatal("read altered Seen")
+	}
+}
+
+func TestRecentDisappearsWithoutModseqChange(t *testing.T) {
+	peer := makePeer(t, true, "IMAP4rev1 CONDSTORE", func(p *testPeer) bool {
+		switch p.command {
+		case "EXAMINE":
+			p.selectBox(7, 1, 20)
+		case "STATUS":
+			p.status(7, 1, 20)
+		case "FETCH":
+			if strings.Contains(p.args, "BODY.PEEK[HEADER]") {
+				p.fetchLiteral(1, 5, "HEADER", "Subject: draft\r\n\r\n")
+			} else {
+				p.send("* 1 FETCH (UID 5)\r\n")
+				p.ok()
+			}
+		case "UID":
+			if !strings.HasPrefix(p.args, "FETCH") {
+				return false
+			}
+			// The second session has no Recent flag, but its persistent flags
+			// and MODSEQ are unchanged, so CHANGEDSINCE returns no updates.
+			if !strings.Contains(p.args, "CHANGEDSINCE 20") {
+				p.send("* 1 FETCH (UID 5 FLAGS (\\Draft \\Recent Recent) MODSEQ (20))\r\n")
+			}
+			p.ok()
+		default:
+			return false
+		}
+		return true
+	})
+	client := New(peer.config(t, true, true, "tls"))
+	store, err := cache.Open(filepath.Join(t.TempDir(), "headers.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	key := mail.MailboxKey{Account: "test", Name: "INBOX"}
+	for i := 0; i < 2; i++ {
+		state, err := store.State(context.Background(), key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		refresh, err := client.Refresh(context.Background(), key.Name, state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if refresh.HighestModSeq != 20 || (i == 1 && (len(refresh.FlagUpdates) != 0 || len(refresh.NewMetadata) != 0)) {
+			t.Fatalf("refresh %d = %+v", i, refresh)
+		}
+		if err := store.Apply(context.Background(), key, refresh); err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.Query(context.Background(), key, mail.SearchQuery{})
+		if err != nil || len(page.Messages) != 1 || strings.Join(page.Messages[0].Flags, " ") != "\\Draft Recent" {
+			t.Fatalf("page %d = %+v, %v", i, page, err)
+		}
+	}
+	commands, _ := peer.snapshot()
+	headers, changedSince := 0, 0
+	for _, command := range commands {
+		if strings.Contains(command, "BODY.PEEK[HEADER]") {
+			headers++
+		}
+		if strings.Contains(command, "CHANGEDSINCE 20") {
+			changedSince++
+		}
+		if strings.HasPrefix(command, "SELECT ") || strings.HasPrefix(command, "UID STORE ") {
+			t.Fatalf("readonly refresh mutated mailbox: %s", command)
+		}
+	}
+	if headers != 1 || changedSince != 1 {
+		t.Fatalf("headers=%d CHANGEDSINCE=%d", headers, changedSince)
+	}
+}
+
+func TestRecentSearchRejectedBeforeNetwork(t *testing.T) {
+	peer := makePeer(t, true, "IMAP4rev1", nil)
+	client := New(peer.config(t, true, true, "tls"))
+	for _, q := range []mail.SearchQuery{
+		{Flags: []string{"\\Recent"}},
+		{NotFlags: []string{"\\rEcEnT"}},
+		{Flags: []string{"\\Recent"}, BeforeUID: 1},
+	} {
+		q.Mailbox = "INBOX"
+		_, err := client.SearchUIDs(context.Background(), q)
+		requireCode(t, err, "invalid_argument")
+		_, err = client.ThreadMessages(context.Background(), mail.ThreadRequest{Mailbox: "INBOX", Query: q})
+		requireCode(t, err, "invalid_argument")
+	}
+	if commands, connections := peer.snapshot(); len(commands) != 0 || connections != 0 {
+		t.Fatalf("invalid search contacted server: %v, connections=%d", commands, connections)
+	}
+	criteria, err := searchCriteria(mail.SearchQuery{Flags: []string{"Recent"}})
+	if err != nil || len(criteria.Flag) != 1 || criteria.Flag[0] != "Recent" {
+		t.Fatalf("ordinary keyword Recent criteria=%+v, %v", criteria, err)
 	}
 }
 

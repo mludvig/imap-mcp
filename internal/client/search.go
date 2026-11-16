@@ -37,6 +37,13 @@ func expandUIDs(set imap.UIDSet, max uint64) ([]uint32, error) {
 
 func searchCriteria(q mail.SearchQuery) (*imap.SearchCriteria, error) {
 	result := &imap.SearchCriteria{Larger: q.MinSize, Smaller: q.MaxSize}
+	for _, flags := range [][]string{q.Flags, q.NotFlags} {
+		for _, flag := range flags {
+			if strings.EqualFold(flag, "\\Recent") {
+				return nil, mail.NewError("invalid_argument", "Searching the Recent flag is not supported")
+			}
+		}
+	}
 	if q.MinSize < 0 || q.MaxSize < 0 {
 		return nil, mail.NewError("invalid_argument", "Message size constraints must be nonnegative")
 	}

@@ -56,6 +56,7 @@ func (c *Cache) Get(ctx context.Context, key mail.MailboxKey, uids []uint32) ([]
 		if err := json.Unmarshal(encoded, &summary); err != nil {
 			return nil, err
 		}
+		summary.Flags = persistentFlags(summary.Flags)
 		summaries = append(summaries, summary)
 	}
 	if err := tx.Commit(); err != nil {

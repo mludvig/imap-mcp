@@ -171,6 +171,21 @@ type record struct {
 	headers map[string][]string
 }
 
+// Recent is session state, not a persistent flag tracked by MODSEQ.
+// See docs/concepts/cache-coherence.md for legacy summary cleanup.
+func persistentFlags(flags []string) []string {
+	if !hasFlag(flags, "\\Recent") {
+		return flags
+	}
+	result := make([]string, 0, len(flags))
+	for _, flag := range flags {
+		if !strings.EqualFold(flag, "\\Recent") {
+			result = append(result, flag)
+		}
+	}
+	return result
+}
+
 func readRecords(ctx context.Context, tx *sql.Tx, key mail.MailboxKey) (map[uint32]record, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT uid, summary, headers FROM messages WHERE account=? AND mailbox=?`, key.Account, key.Name)
 	if err != nil {
@@ -289,7 +304,7 @@ func (c *Cache) Apply(ctx context.Context, key mail.MailboxKey, refresh mail.Ref
 	for uid := range members {
 		item, hasMetadata := metadata[uid]
 		update, hasFlags := flags[uid]
-		if !hasMetadata && !hasFlags {
+		if !hasMetadata && !hasFlags && !hasFlag(old[uid].summary.Flags, "\\Recent") {
 			continue
 		}
 		if !hasMetadata {
@@ -302,6 +317,7 @@ func (c *Cache) Apply(ctx context.Context, key mail.MailboxKey, refresh mail.Ref
 			item.summary.Flags = append([]string{}, update.Flags...)
 			item.summary.ModSeq = update.ModSeq
 		}
+		item.summary.Flags = persistentFlags(item.summary.Flags)
 		summary, err := json.Marshal(item.summary)
 		if err != nil {
 			return err

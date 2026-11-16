@@ -1,0 +1,27 @@
+# Stdio MCP contract
+
+## What it is
+
+One local CLI process exposes the configured account through the official Go MCP SDK's stdio transport. The startup inventory is eight read tools, plus six mutation tools only when readonly is false.
+
+## How it works
+
+The CLI loads configuration, opens one persistent cache, creates one service, and closes the cache when stdio ends or SIGINT/SIGTERM cancels the server. Typed tools return `{data: T}` or `{error: mail.Error}` in structured content and the same JSON in a text fallback; domain errors set `isError` and contain no data.
+
+## Why
+
+See [ADR 0001](../adr/0001-go-stdio-startup-policy.md) for the transport and immutable startup-mode decision, and [ADR 0003](../adr/0003-safe-imap-operations.md) for mutation uncertainty.
+
+## Where it lives
+
+`cmd/imap-mcp/main.go`: `main` and `run`; `internal/server/server.go`: `New`, `add`, `threadSchema`, `publicError`, `result`, and `marshalResult`; `internal/server/inputs.go`: `queryInput`, `threadCriteriaInput`, `threadInput`, and defaults; `internal/mail/model.go`: authoritative output/reference/error types. `internal/service/service.go`: `Service.ThreadMessages`; `internal/client/search.go`: `Client.ThreadMessages` and `convertThreads`.
+
+## Invariants & gotchas
+
+Only protocol output belongs on stdout. `listChanged` is false (the SDK omits the false JSON field), configuration is never reloaded, optional DTO fields must stay optional in input schemas, and SDK argument errors need not contain the structured domain envelope.
+
+SDK automatic schema inference rejects recursive THREAD types, so `threadSchema` explicitly supplies a recursive `$defs/thread_node` while retaining the actual nested result. `marshalResult` serializes the complete SDK `CallToolResult`, counting both structured JSON and escaped text fallback, and `result` rejects sizes above `maxResultBytes` (8 MiB minus 1 KiB).
+
+Native THREAD returns complete server-provided trees for the matching criteria; its nested query excludes `limit`, `sort`, and `before_uid`, and the service rejects these controls when supplied directly. Do not reuse the paged search schema or trim nodes to a page size: that advertises ignored controls or changes tree structure. Narrow the criteria if a complete result exceeds the serialized result budget; list/search retain their separate 50-default, 200-maximum page contract.
+
+This budget applies before JSON-RPC framing; the SDK adds and echoes the request ID outside the typed tool handler, so the 1 KiB allowance does not guarantee a complete response below 8 MiB for arbitrarily large valid IDs. `run` uses SDK stdio directly, with no additional transport wrapper.

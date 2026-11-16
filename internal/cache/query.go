@@ -16,6 +16,13 @@ import (
 // substrings after NFC normalization and Unicode case folding, never SQL LIKE.
 // Only descending UID is pageable because the cursor is an exclusive upper UID.
 func (c *Cache) Query(ctx context.Context, key mail.MailboxKey, q mail.SearchQuery) (mail.MessagePage, error) {
+	for _, flags := range [][]string{q.Flags, q.NotFlags} {
+		for _, flag := range flags {
+			if strings.EqualFold(flag, "\\Recent") {
+				return mail.MessagePage{}, mail.NewError("invalid_argument", "Searching the Recent flag is not supported")
+			}
+		}
+	}
 	key, err := canonicalKey(key)
 	if err != nil {
 		return mail.MessagePage{}, err
@@ -91,6 +98,7 @@ func (c *Cache) Query(ctx context.Context, key mail.MailboxKey, q mail.SearchQue
 		if err := ctx.Err(); err != nil {
 			return mail.MessagePage{}, err
 		}
+		item.summary.Flags = persistentFlags(item.summary.Flags)
 		if !matches(item, q) {
 			continue
 		}

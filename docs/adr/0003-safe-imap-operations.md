@@ -14,4 +14,8 @@ Use EXAMINE for read selections and BODY.PEEK for fetched headers, message bodie
 
 ## Consequences
 
-Servers without native MOVE can support reads and permitted writes but cannot support move or Trash; the capability gate must precede the upstream call because beta.9 otherwise falls back to Deleted plus EXPUNGE. Native MOVE removes source membership as part of that server operation; the client adds no separate deletion step, reports missing UID mapping explicitly, and implements no QRESYNC, conditional STORE, BINARY retrieval, partial body fetches, or mutation replay. Each operation owns a connection rather than sharing mutable IMAP session state; the planned service serializes operations with one account lock and reinforces readonly tool omission with write checks.
+Servers without native MOVE can support reads and permitted writes but cannot support move or Trash; the capability gate must precede the upstream call because beta.9 otherwise falls back to Deleted plus EXPUNGE. Native MOVE removes source membership as part of that server operation; the client adds no separate deletion step, reports missing UID mapping explicitly, and implements no QRESYNC, conditional STORE, BINARY retrieval, partial body fetches, or mutation replay. Each operation owns a connection rather than sharing mutable IMAP session state; the service serializes cache refresh/lookup and mutations with one account lock and reinforces readonly tool omission with write checks.
+
+## Integration findings
+
+Rev2 native MOVE can report removed source UIDs through VANISHED without any explicit EXPUNGE command from this client. [ADR 0004](0004-backport-imap4rev2-vanished.md) preserves that native operation with a decoder backport; accepting its response does not expose QRESYNC or relax the deletion policy.

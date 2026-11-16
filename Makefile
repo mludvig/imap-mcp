@@ -12,12 +12,8 @@ prepare:
 	mkdir -p "$(GOPATH)" "$(GOMODCACHE)" "$(GOCACHE)" "$(TMPDIR)"
 
 build: prepare
-ifneq ($(wildcard cmd/imap-mcp/main.go),)
 	mkdir -p bin
 	$(GO) build -o bin/imap-mcp ./cmd/imap-mcp
-else
-	$(GO) build ./...
-endif
 
 test: prepare
 	$(GO) test ./...

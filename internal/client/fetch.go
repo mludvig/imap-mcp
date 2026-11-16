@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -35,7 +36,14 @@ func (s *session) fetch(set imap.NumSet, opts *imap.FetchOptions, section *imap.
 			case imapclient.FetchItemDataUID:
 				item.uid = uint32(data.UID)
 			case imapclient.FetchItemDataFlags:
-				item.flags = stringsOf(data.Flags)
+				// Recent is session state, outside MODSEQ tracking; see
+				// docs/concepts/cache-coherence.md for persistent flag semantics.
+				item.flags = make([]string, 0, len(data.Flags))
+				for _, flag := range data.Flags {
+					if !strings.EqualFold(string(flag), "\\Recent") {
+						item.flags = append(item.flags, string(flag))
+					}
+				}
 				item.haveFlags = true
 			case imapclient.FetchItemDataModSeq:
 				item.modseq = data.ModSeq
